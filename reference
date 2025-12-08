@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""
+Opinion Trade 자동 거래 봇 (Python GUI 버전) - Resolution Claim 추가
+"""
+
+import os
+import threading
+import time
+import requests
+from tkinter import *
+from tkinter import ttk, scrolledtext, messagebox
+from dotenv import load_dotenv
+from web3 import Web3
+from eth_account import Account
+
+# 환경변수 로드
+load_dotenv()
+
+# Conditional Tokens ABI (redeemPositions 함수)
+CONDITIONAL_TOKENS_ABI = [
+    {
+        "inputs": [
+            {"internalType": "contract IERC20", "name": "collateralToken", "type": "address"},
+            {"internalType": "bytes32", "name": "parentCollectionId", "type": "bytes32"},
+            {"internalType": "bytes32", "name": "conditionId", "type": "bytes32"},
+            {"internalType": "uint256[]", "name": "indexSets", "type": "uint256[]"}
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"internalType": "bytes32", "name": "conditionId", "type": "bytes32"}
+        ],
+        "name": "payoutDenominator",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "account", "type": "address"},
+            {"internalType": "uint256", "name": "id", "type": "uint256"}
+        ],
+        "name": "balanceOf",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+
+class OpinionTradeBot:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Opinion Trade Bot + Claim")
+        self.root.geometry("1200x800")
+
+        # 설정
+        self.api_key = os.getenv('API_KEY', '')
+        self.rpc_url = os.getenv('RPC_URL', 'https://bsc-dataseed.binance.org')
+        self.private_key = os.getenv('PRIVATE_KEY', '')
+        self.signer_address = os.getenv('SIGNER_ADDRESS', '')
+        self.maker_address = os.getenv('MAKER_ADDRESS', '')
+        self.order_amount = float(os.getenv('ORDER_AMOUNT', '5.0'))
+        self.jwt_token = os.getenv('JWT_TOKEN', '')
+
+        # Contract addresses
+        self.conditional_tokens_addr = '0xAD1a38cEc043e70E83a3eC30443dB285ED10D774'
+        self.usdt_addr = '0x55d398326f99059fF775485246999027B3197955'
+        self.multisend_addr = '0x998739BFdAAdde7C933B942a68053933098f9EDa'
+
+        # Web3
+        self.w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+
+        self.client = None
+        self.topics = []
+        self.claimable_positions = []
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        # 노트북 (탭)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=BOTH, expand=True, padx=10, pady=5)
+
+        # 탭 1: 거래
+        self.trade_tab = Frame(self.notebook)
+        self.notebook.add(self.trade_tab, text="📈 거래")
+
+        # 탭 2: 클레임
+        self.claim_tab = Frame(self.notebook)
+        self.notebook.add(self.claim_tab, text="💰 Claim")
+
+        self.create_trade_tab()
+        self.create_claim_tab()
+
+        # 상태바
+        self.status_var = StringVar(value="대기 중...")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=SUNKEN, anchor='w')
+        status_bar.pack(fill=X, side=BOTTOM, padx=10, pady=5)
+
+    def create_trade_tab(self):
+        """거래 탭 UI"""
+        # 상단 설정 패널
+        config_frame = ttk.LabelFrame(self.trade_tab, text="설정", padding=10)
+        config_frame.pack(fill=X, padx=10, pady=5)
+
+        # API Key
+        ttk.Label(config_frame, text="API Key:").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+        self.api_key_var = StringVar(value=self.api_key[:20] + "...")
+        ttk.Entry(config_frame, textvariable=self.api_key_var, width=40, state='readonly').grid(row=0, column=1, padx=5, pady=2)
+
+        # Signer
+        ttk.Label(config_frame, text="Signer:").grid(row=1, column=0, sticky='w', padx=5, pady=2)
+        self.signer_var = StringVar(value=self.signer_address)
+        ttk.Entry(config_frame, textvariable=self.signer_var, width=50, state='readonly').grid(row=1, column=1, padx=5, pady=2)
+
+        # Maker
+        ttk.Label(config_frame, text="Maker:").grid(row=2, column=0, sticky='w', padx=5, pady=2)
+        self.maker_var = StringVar(value=self.maker_address)
+        ttk.Entry(config_frame, textvariable=self.maker_var, width=50, state='readonly').grid(row=2, column=1, padx=5, pady=2)
+
+        # 주문 금액
+        ttk.Label(config_frame, text="주문 금액:").grid(row=3, column=0, sticky='w', padx=5, pady=2)
+        self.amount_var = DoubleVar(value=self.order_amount)
+        ttk.Entry(config_frame, textvariable=self.amount_var, width=20).grid(row=3, column=1, sticky='w', padx=5, pady=2)
+        ttk.Label(config_frame, text="USDT").grid(row=3, column=2, sticky='w', padx=5, pady=2)
+
+        # 토픽 개수
+        ttk.Label(config_frame, text="로드할 토픽 개수:").grid(row=4, column=0, sticky='w', padx=5, pady=2)
+        self.limit_var = IntVar(value=50)
+        ttk.Entry(config_frame, textvariable=self.limit_var, width=20).grid(row=4, column=1, sticky='w', padx=5, pady=2)
+
+        # 토픽 타입
+        ttk.Label(config_frame, text="토픽 타입:").grid(row=5, column=0, sticky='w', padx=5, pady=2)
+        self.topic_type_var = StringVar(value="ALL")
+        type_combo = ttk.Combobox(config_frame, textvariable=self.topic_type_var, width=18, state='readonly')
+        type_combo['values'] = ('ALL', 'REGULAR', 'INDICATOR')
+        type_combo.grid(row=5, column=1, sticky='w', padx=5, pady=2)
+
+        # 버튼
+        button_frame = Frame(self.trade_tab)
+        button_frame.pack(fill=X, padx=10, pady=5)
+
+        self.init_btn = ttk.Button(button_frame, text="Client 초기화", command=self.init_client)
+        self.init_btn.pack(side=LEFT, padx=5)
+
+        self.load_btn = ttk.Button(button_frame, text="토픽 로드", command=self.load_topics, state=DISABLED)
+        self.load_btn.pack(side=LEFT, padx=5)
+
+        self.trade_btn = ttk.Button(button_frame, text="선택한 토픽 거래", command=self.execute_trading, state=DISABLED)
+        self.trade_btn.pack(side=LEFT, padx=5)
+
+        ttk.Button(button_frame, text="로그 지우기", command=self.clear_trade_log).pack(side=RIGHT, padx=5)
+
+        # 토픽 리스트 & 로그
+        main_frame = ttk.PanedWindow(self.trade_tab, orient=HORIZONTAL)
+        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=5)
+
+        topic_frame = ttk.LabelFrame(main_frame, text="토픽 목록", padding=10)
+        main_frame.add(topic_frame, weight=1)
+
+        topic_scroll_frame = Frame(topic_frame)
+        topic_scroll_frame.pack(fill=BOTH, expand=True)
+
+        topic_scrollbar = Scrollbar(topic_scroll_frame)
+        topic_scrollbar.pack(side=RIGHT, fill=Y)
+
+        self.topic_listbox = Listbox(topic_scroll_frame, selectmode=MULTIPLE, yscrollcommand=topic_scrollbar.set)
+        self.topic_listbox.pack(side=LEFT, fill=BOTH, expand=True)
+        topic_scrollbar.config(command=self.topic_listbox.yview)
+
+        ttk.Button(topic_frame, text="전체 선택", command=self.select_all_topics).pack(fill=X, pady=5)
+
+        log_frame = ttk.LabelFrame(main_frame, text="로그", padding=10)
+        main_frame.add(log_frame, weight=2)
+
+        self.trade_log = scrolledtext.ScrolledText(log_frame, wrap=WORD, width=60, height=25)
+        self.trade_log.pack(fill=BOTH, expand=True)
+
+    def create_claim_tab(self):
+        """클레임 탭 UI"""
+        # 설정 패널
+        config_frame = ttk.LabelFrame(self.claim_tab, text="Claim 설정", padding=10)
+        config_frame.pack(fill=X, padx=10, pady=5)
+
+        ttk.Label(config_frame, text="Signer Address:").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+        self.claim_signer_var = StringVar(value=self.signer_address)
+        ttk.Entry(config_frame, textvariable=self.claim_signer_var, width=50, state='readonly').grid(row=0, column=1, padx=5, pady=2)
+
+        ttk.Label(config_frame, text="Maker Address:").grid(row=1, column=0, sticky='w', padx=5, pady=2)
+        self.claim_maker_var = StringVar(value=self.maker_address)
+        ttk.Entry(config_frame, textvariable=self.claim_maker_var, width=50, state='readonly').grid(row=1, column=1, padx=5, pady=2)
+
+        ttk.Label(config_frame, text="조회 개수:").grid(row=2, column=0, sticky='w', padx=5, pady=2)
+        self.claim_limit_var = IntVar(value=100)
+        ttk.Entry(config_frame, textvariable=self.claim_limit_var, width=20).grid(row=2, column=1, sticky='w', padx=5, pady=2)
+
+        # 버튼
+        button_frame = Frame(self.claim_tab)
+        button_frame.pack(fill=X, padx=10, pady=5)
+
+        ttk.Button(button_frame, text="🔍 클레임 가능한 포지션 조회", command=self.load_claimable_positions).pack(side=LEFT, padx=5)
+        ttk.Button(button_frame, text="💰 선택한 마켓 클레임 (SDK)", command=self.execute_claim_sdk).pack(side=LEFT, padx=5)
+        ttk.Button(button_frame, text="✅ 전체 선택", command=self.select_all_claims).pack(side=LEFT, padx=5)
+        ttk.Button(button_frame, text="❌ 선택 해제", command=self.deselect_all_claims).pack(side=LEFT, padx=5)
+        ttk.Button(button_frame, text="로그 지우기", command=self.clear_claim_log).pack(side=RIGHT, padx=5)
+
+        # 요약 정보
+        summary_frame = ttk.LabelFrame(self.claim_tab, text="요약", padding=10)
+        summary_frame.pack(fill=X, padx=10, pady=5)
+
+        self.summary_var = StringVar(value="조회 전...")
+        ttk.Label(summary_frame, textvariable=self.summary_var, font=('Arial', 10, 'bold')).pack(anchor='w')
+
+        # 포지션 리스트 & 로그
+        main_frame = ttk.PanedWindow(self.claim_tab, orient=HORIZONTAL)
+        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=5)
+
+        # Treeview로 변경
+        position_frame = ttk.LabelFrame(main_frame, text="클레임 가능한 마켓", padding=10)
+        main_frame.add(position_frame, weight=1)
+
+        columns = ('market_id', 'topic', 'type', 'shares', 'profit')
+        self.claim_tree = ttk.Treeview(position_frame, columns=columns, show='headings', selectmode='extended')
+
+        self.claim_tree.heading('market_id', text='Market ID')
+        self.claim_tree.heading('topic', text='토픽')
+        self.claim_tree.heading('type', text='타입')
+        self.claim_tree.heading('shares', text='Shares')
+        self.claim_tree.heading('profit', text='Profit')
+
+        self.claim_tree.column('market_id', width=80, anchor='center')
+        self.claim_tree.column('topic', width=250, anchor='w')
+        self.claim_tree.column('type', width=50, anchor='center')
+        self.claim_tree.column('shares', width=80, anchor='e')
+        self.claim_tree.column('profit', width=80, anchor='e')
+
+        tree_scroll = ttk.Scrollbar(position_frame, orient=VERTICAL, command=self.claim_tree.yview)
+        self.claim_tree.configure(yscrollcommand=tree_scroll.set)
+
+        self.claim_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        tree_scroll.pack(side=RIGHT, fill=Y)
+
+        log_frame = ttk.LabelFrame(main_frame, text="Claim 로그", padding=10)
+        main_frame.add(log_frame, weight=1)
+
+        self.claim_log = scrolledtext.ScrolledText(log_frame, wrap=WORD, width=50, height=25)
+        self.claim_log.pack(fill=BOTH, expand=True)
+
+    def log(self, message, level="INFO", target="trade"):
+        """로그 출력"""
+        timestamp = time.strftime("%H:%M:%S")
+        log_widget = self.trade_log if target == "trade" else self.claim_log
+
+        log_widget.insert(END, f"[{timestamp}] {message}\n")
+
+        line_start = log_widget.index("end-2c linestart")
+        line_end = log_widget.index("end-1c")
+        log_widget.tag_add(level, line_start, line_end)
+
+        colors = {"INFO": "black", "SUCCESS": "green", "ERROR": "red", "WARNING": "orange"}
+        log_widget.tag_config(level, foreground=colors.get(level, "black"))
+
+        log_widget.see(END)
+        self.root.update()
+
+    def clear_trade_log(self):
+        self.trade_log.delete(1.0, END)
+
+    def clear_claim_log(self):
+        self.claim_log.delete(1.0, END)
+
+    def update_status(self, message):
+        self.status_var.set(message)
+        self.root.update()
+
+    # ==================== CLAIM 기능 (resolvedPoll API + SDK redeem) ====================
+
+    def load_claimable_positions(self):
+        """resolvedPoll API로 클레임 가능한 포지션 조회"""
+        def load():
+            try:
+                self.update_status("클레임 가능한 포지션 조회 중...")
+                self.log("🔍 resolvedPoll API 조회 시작...", "INFO", "claim")
+
+                wallet_address = self.claim_signer_var.get()
+                limit = self.claim_limit_var.get()
+
+                all_positions = []
+                page = 1
+                per_page = min(limit, 50)
+
+                while len(all_positions) < limit:
+                    url = f"https://proxy.opinion.trade:8443/api/bsc/api/v2/resolvedPoll"
+                    params = {
+                        "page": page,
+                        "limit": per_page,
+                        "walletAddress": wallet_address,
+                        "chainId": "56"
+                    }
+
+                    headers = {
+                        "accept": "application/json",
+                        "apikey": self.api_key,
+                    }
+
+                    if self.jwt_token:
+                        headers["authorization"] = f"Bearer {self.jwt_token}"
+
+                    self.log(f"   페이지 {page} 조회 중...", "INFO", "claim")
+
+                    response = requests.get(url, params=params, headers=headers)
+                    data = response.json()
+
+                    if data.get('errno') != 0:
+                        self.log(f"❌ API 에러: {data.get('errmsg')}", "ERROR", "claim")
+                        break
+
+                    result = data.get('result', {})
+                    positions = result.get('list', [])
+                    total = result.get('total', 0)
+
+                    self.log(f"   페이지 {page}: {len(positions)}개 / 전체 {total}개", "INFO", "claim")
+
+                    if not positions:
+                        break
+
+                    all_positions.extend(positions)
+
+                    if len(all_positions) >= total or len(positions) < per_page:
+                        break
+
+                    page += 1
+                    time.sleep(0.3)
+
+                self.log(f"\n📋 총 {len(all_positions)}개 포지션 조회 완료", "SUCCESS", "claim")
+
+                # claimStatus가 1인 것만 필터링
+                claimable = [p for p in all_positions if p.get('claimStatus') == 1]
+                self.log(f"✅ 클레임 가능: {len(claimable)}개", "SUCCESS", "claim")
+
+                # topicId(market_id) 별로 그룹화 (SDK redeem은 market_id 사용)
+                market_map = {}
+                for pos in claimable:
+                    market_id = pos.get('topicId')
+                    if market_id not in market_map:
+                        market_map[market_id] = pos
+                    else:
+                        # profit 합산
+                        existing = market_map[market_id]
+                        existing_profit = float(existing.get('profit', 0) or 0)
+                        new_profit = float(pos.get('profit', 0) or 0)
+                        existing['profit'] = str(existing_profit + new_profit)
+                        # shares 합산
+                        existing_shares = float(existing.get('totalShares', 0) or 0)
+                        new_shares = float(pos.get('totalShares', 0) or 0)
+                        existing['totalShares'] = str(existing_shares + new_shares)
+
+                self.claimable_positions = list(market_map.values())
+                self.log(f"📊 고유 Market ID: {len(self.claimable_positions)}개", "INFO", "claim")
+
+                # 요약 계산
+                total_profit = sum(float(p.get('profit', 0) or 0) for p in self.claimable_positions)
+                total_shares = sum(float(p.get('totalShares', 0) or 0) for p in self.claimable_positions)
+
+                self.summary_var.set(
+                    f"클레임 가능: {len(self.claimable_positions)}개 마켓 | "
+                    f"총 Shares: {total_shares:.4f} | "
+                    f"예상 Profit: {total_profit:.4f} USDT"
+                )
+
+                # Treeview 업데이트
+                for item in self.claim_tree.get_children():
+                    self.claim_tree.delete(item)
+
+                for pos in self.claimable_positions:
+                    market_id = pos.get('topicId', 'N/A')
+                    topic = f"{pos.get('mutilTitle', '')[:25]}... - {pos.get('topicTitle', '')}"
+                    tx_type = pos.get('txObject', 'N/A')
+                    shares = f"{float(pos.get('totalShares', 0) or 0):.4f}"
+                    profit = float(pos.get('profit', 0) or 0)
+                    profit_str = f"{profit:+.4f}" if profit != 0 else "0"
+
+                    self.claim_tree.insert('', END, values=(market_id, topic, tx_type, shares, profit_str))
+
+                self.update_status(f"{len(self.claimable_positions)}개 마켓 클레임 가능")
+
+            except Exception as e:
+                self.log(f"❌ 조회 실패: {e}", "ERROR", "claim")
+                import traceback
+                self.log(traceback.format_exc(), "ERROR", "claim")
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def select_all_claims(self):
+        for item in self.claim_tree.get_children():
+            self.claim_tree.selection_add(item)
+
+    def deselect_all_claims(self):
+        for item in self.claim_tree.selection():
+            self.claim_tree.selection_remove(item)
+
+    def execute_claim_sdk(self):
+        """SDK의 redeem() 메서드를 사용하여 클레임"""
+        if not self.client:
+            messagebox.showerror("오류", "먼저 '거래' 탭에서 Client를 초기화하세요.")
+            return
+
+        selected_items = self.claim_tree.selection()
+
+        if not selected_items:
+            messagebox.showwarning("경고", "클레임할 마켓을 선택하세요.")
+            return
+
+        selected_indices = [self.claim_tree.index(item) for item in selected_items]
+        selected_positions = [self.claimable_positions[i] for i in selected_indices]
+
+        total_profit = sum(float(p.get('profit', 0) or 0) for p in selected_positions)
+
+        confirm = messagebox.askyesno(
+            "클레임 확인",
+            f"{len(selected_positions)}개 마켓을 클레임하시겠습니까?\n\n"
+            f"예상 Profit: {total_profit:.4f} USDT\n\n"
+            f"SDK redeem() 메서드 사용"
+        )
+
+        if not confirm:
+            return
+
+        def claim():
+            try:
+                self.update_status("클레임 실행 중...")
+                self.log("=" * 60, "INFO", "claim")
+                self.log(f"💰 SDK redeem() 사용 - {len(selected_positions)}개 마켓 클레임", "INFO", "claim")
+                self.log("=" * 60, "INFO", "claim")
+
+                success_count = 0
+                fail_count = 0
+                no_position_count = 0
+
+                for idx, pos in enumerate(selected_positions, 1):
+                    market_id = pos.get('topicId')
+                    topic_title = f"{pos.get('mutilTitle', '')} - {pos.get('topicTitle', '')}"
+                    profit = float(pos.get('profit', 0) or 0)
+
+                    self.log(f"\n[{idx}/{len(selected_positions)}] Market ID: {market_id}", "INFO", "claim")
+                    self.log(f"   {topic_title[:50]}...", "INFO", "claim")
+                    self.log(f"   예상 Profit: {profit:+.4f} USDT", "INFO", "claim")
+
+                    try:
+                        # SDK redeem() 호출
+                        self.log(f"   ⏳ redeem({market_id}) 호출 중...", "INFO", "claim")
+
+                        result = self.client.redeem(
+                            market_id=int(market_id),
+                            check_approval=True
+                        )
+
+                        # 반환값 타입 확인 및 처리
+                        self.log(f"   📝 반환값 타입: {type(result)}", "INFO", "claim")
+
+                        # Tuple인 경우 (tx_hash, receipt, event)
+                        if isinstance(result, tuple):
+                            tx_hash, receipt, event = result
+                            if receipt and hasattr(receipt, 'status') and receipt.status == 1:
+                                tx_hex = tx_hash.hex() if hasattr(tx_hash, 'hex') else str(tx_hash)
+                                self.log(f"   ✅ TX: {tx_hex}", "SUCCESS", "claim")
+                                if hasattr(receipt, 'gasUsed'):
+                                    self.log(f"   Gas Used: {receipt.gasUsed}", "INFO", "claim")
+                                success_count += 1
+                            elif receipt and hasattr(receipt, 'status'):
+                                self.log(f"   ❌ TX 실패 (status={receipt.status})", "ERROR", "claim")
+                                fail_count += 1
+                            else:
+                                # receipt이 dict일 수도 있음
+                                if isinstance(receipt, dict) and receipt.get('status') == 1:
+                                    tx_hex = tx_hash.hex() if hasattr(tx_hash, 'hex') else str(tx_hash)
+                                    self.log(f"   ✅ TX: {tx_hex}", "SUCCESS", "claim")
+                                    success_count += 1
+                                else:
+                                    self.log(f"   ⚠️ 결과 확인 필요: {result}", "WARNING", "claim")
+                                    success_count += 1  # 일단 성공으로 처리
+
+                        # String인 경우 (tx_hash만 반환)
+                        elif isinstance(result, str):
+                            self.log(f"   ✅ TX: {result}", "SUCCESS", "claim")
+                            success_count += 1
+
+                        # bytes인 경우
+                        elif isinstance(result, bytes):
+                            self.log(f"   ✅ TX: {result.hex()}", "SUCCESS", "claim")
+                            success_count += 1
+
+                        # API Response 객체인 경우
+                        elif hasattr(result, 'errno'):
+                            if result.errno == 0:
+                                self.log(f"   ✅ 성공: {result}", "SUCCESS", "claim")
+                                success_count += 1
+                            else:
+                                self.log(f"   ❌ 실패: {result.errmsg}", "ERROR", "claim")
+                                fail_count += 1
+
+                        else:
+                            self.log(f"   ⚠️ 알 수 없는 반환값: {result}", "WARNING", "claim")
+                            self.log(f"   타입: {type(result)}, 내용: {str(result)[:200]}", "INFO", "claim")
+                            success_count += 1  # 에러가 아니면 성공으로 처리
+
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "NoPositionsToRedeem" in error_msg or "no winning positions" in error_msg.lower():
+                            self.log(f"   ⚠️ 클레임할 포지션 없음 (이미 클레임됨?)", "WARNING", "claim")
+                            no_position_count += 1
+                        else:
+                            self.log(f"   ❌ 에러: {e}", "ERROR", "claim")
+                            import traceback
+                            self.log(f"   {traceback.format_exc()}", "ERROR", "claim")
+                            fail_count += 1
+
+                    time.sleep(2)
+
+                self.log("\n" + "=" * 60, "INFO", "claim")
+                self.log(f"🏁 클레임 완료", "INFO", "claim")
+                self.log(f"   성공: {success_count}", "SUCCESS", "claim")
+                self.log(f"   실패: {fail_count}", "ERROR" if fail_count > 0 else "INFO", "claim")
+                self.log(f"   포지션 없음: {no_position_count}", "WARNING" if no_position_count > 0 else "INFO", "claim")
+                self.log("=" * 60, "INFO", "claim")
+
+                self.update_status("클레임 완료")
+                messagebox.showinfo(
+                    "완료",
+                    f"클레임 완료\n\n"
+                    f"성공: {success_count}\n"
+                    f"실패: {fail_count}\n"
+                    f"포지션 없음: {no_position_count}"
+                )
+
+                # 목록 새로고침
+                if success_count > 0:
+                    self.load_claimable_positions()
+
+            except Exception as e:
+                self.log(f"❌ 클레임 실패: {e}", "ERROR", "claim")
+                import traceback
+                self.log(traceback.format_exc(), "ERROR", "claim")
+
+        threading.Thread(target=claim, daemon=True).start()
+
+    # ==================== 기존 거래 기능 ====================
+
+    def init_client(self):
+        """Client 초기화"""
+        try:
+            from opinion_clob_sdk import Client
+
+            self.update_status("Client 초기화 중...")
+            self.log("Opinion Trade Client 초기화", "INFO", "trade")
+
+            if not self.private_key:
+                messagebox.showerror("오류", "PRIVATE_KEY가 설정되지 않았습니다.")
+                return
+
+            self.client = Client(
+                host='https://proxy.opinion.trade:8443',
+                apikey=self.api_key,
+                chain_id=56,
+                rpc_url=self.rpc_url,
+                private_key=self.private_key,
+                multi_sig_addr=self.maker_address,
+                conditional_tokens_addr=self.conditional_tokens_addr,
+                multisend_addr=self.multisend_addr
+            )
+
+            self.log("✅ Client 초기화 완료", "SUCCESS", "trade")
+            self.log("   (Claim 기능도 사용 가능)", "INFO", "trade")
+            self.init_btn.config(state=DISABLED)
+            self.load_btn.config(state=NORMAL)
+
+        except ImportError:
+            self.log("⚠️ opinion_clob_sdk 미설치 - 거래/클레임 기능 비활성화", "WARNING", "trade")
+            messagebox.showwarning("경고", "opinion_clob_sdk가 설치되지 않았습니다.\npip install opinion_clob_sdk")
+        except Exception as e:
+            self.log(f"❌ 초기화 실패: {e}", "ERROR", "trade")
+            import traceback
+            self.log(traceback.format_exc(), "ERROR", "trade")
+
+    def load_topics(self):
+        """토픽 로드"""
+        def load():
+            try:
+                target_limit = self.limit_var.get()
+                topic_type_filter = self.topic_type_var.get()
+
+                self.update_status("토픽 로딩 중...")
+                self.log(f"🔎 토픽 로딩 시작 (목표: {target_limit}개)", "INFO", "trade")
+
+                all_topics = []
+
+                if topic_type_filter in ['ALL', 'REGULAR']:
+                    regular = self.load_regular_topics(target_limit)
+                    for t in regular:
+                        t['_type'] = 'REGULAR'
+                    all_topics.extend(regular)
+                    self.log(f"   일반 토픽: {len(regular)}개", "SUCCESS", "trade")
+
+                if topic_type_filter in ['ALL', 'INDICATOR']:
+                    indicator = self.load_indicator_topics(target_limit)
+                    for t in indicator:
+                        t['_type'] = 'INDICATOR'
+                    all_topics.extend(indicator)
+                    self.log(f"   지표 토픽: {len(indicator)}개", "SUCCESS", "trade")
+
+                self.topics = all_topics[:target_limit]
+                self.log(f"✅ 총 {len(self.topics)}개 토픽 로드", "SUCCESS", "trade")
+
+                self.topic_listbox.delete(0, END)
+                for topic in self.topics:
+                    topic_type = topic.get('_type', 'U')[0]
+                    title = topic.get('title', 'Unknown')[:65]
+                    topic_id = topic.get('topicId', 'N/A')
+                    self.topic_listbox.insert(END, f"[{topic_type}] [{topic_id}] {title}")
+
+                self.trade_btn.config(state=NORMAL)
+                self.update_status(f"{len(self.topics)}개 토픽 로드 완료")
+
+            except Exception as e:
+                self.log(f"❌ 로딩 실패: {e}", "ERROR", "trade")
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def load_regular_topics(self, limit):
+        all_topics = []
+        page = 1
+
+        while len(all_topics) < limit:
+            url = "https://proxy.opinion.trade:8443/api/bsc/api/v2/topic"
+            params = {"page": page, "limit": 20, "chainId": "56", "status": "2"}
+            headers = {"accept": "application/json", "apikey": self.api_key}
+
+            response = requests.get(url, params=params, headers=headers)
+            data = response.json()
+
+            if data.get('errno') != 0:
+                break
+
+            topics = data.get('result', {}).get('list', [])
+            if not topics:
+                break
+
+            all_topics.extend(topics)
+            page += 1
+            time.sleep(0.2)
+
+        return all_topics[:limit]
+
+    def load_indicator_topics(self, limit):
+        all_topics = []
+        page = 1
+
+        while len(all_topics) < limit:
+            url = "https://proxy.opinion.trade:8443/api/bsc/api/v2/indicator"
+            params = {"page": page, "limit": 20, "chainId": "56"}
+            headers = {"accept": "application/json", "apikey": self.api_key}
+
+            response = requests.get(url, params=params, headers=headers)
+            data = response.json()
+
+            if data.get('errno') != 0:
+                break
+
+            indicators = data.get('result', {}).get('list', [])
+            if not indicators:
+                break
+
+            for ind in indicators:
+                topic_data = ind.get('topic', {})
+                if topic_data:
+                    topic_data['title'] = ind.get('title', topic_data.get('title', ''))
+                    all_topics.append(topic_data)
+
+            page += 1
+            time.sleep(0.2)
+
+        return all_topics[:limit]
+
+    def select_all_topics(self):
+        self.topic_listbox.select_set(0, END)
+
+    def execute_trading(self):
+        """거래 실행"""
+        from opinion_clob_sdk.chain.py_order_utils.model.order import PlaceOrderDataInput
+        from opinion_clob_sdk.chain.py_order_utils.model.sides import OrderSide
+        from opinion_clob_sdk.chain.py_order_utils.model.order_type import LIMIT_ORDER
+
+        selected_indices = self.topic_listbox.curselection()
+
+        if not selected_indices:
+            messagebox.showwarning("경고", "거래할 토픽을 선택하세요.")
+            return
+
+        selected_topics = [self.topics[i] for i in selected_indices]
+        order_amount = self.amount_var.get()
+
+        confirm = messagebox.askyesno(
+            "거래 확인",
+            f"{len(selected_topics)}개 토픽에 거래를 시작하시겠습니까?\n주문 금액: {order_amount} USDT"
+        )
+
+        if not confirm:
+            return
+
+        def trade():
+            try:
+                self.trade_btn.config(state=DISABLED)
+                total_success = 0
+                total_fail = 0
+
+                for topic_idx, topic in enumerate(selected_topics, 1):
+                    topic_id = topic.get('topicId')
+                    title = topic.get('title', 'Unknown')
+                    child_list = topic.get('childList', [topic])
+
+                    self.log(f"\n💰 [{topic_idx}/{len(selected_topics)}] {title}", "INFO", "trade")
+
+                    for child in child_list:
+                        child_topic_id = child.get('topicId')
+                        yes_pos = child.get('yesPos', '')
+                        no_pos = child.get('noPos', '')
+                        yes_price = child.get('yesBuyPrice', '0.5')
+                        no_price = child.get('noBuyPrice', '0.5')
+
+                        for pos_type, pos_id, price in [('YES', yes_pos, yes_price), ('NO', no_pos, no_price)]:
+                            if pos_id:
+                                try:
+                                    order = PlaceOrderDataInput(
+                                        marketId=int(child_topic_id),
+                                        tokenId=pos_id,
+                                        side=OrderSide.BUY,
+                                        orderType=LIMIT_ORDER,
+                                        price=price,
+                                        makerAmountInQuoteToken=order_amount
+                                    )
+                                    result = self.client.place_order(order)
+
+                                    if hasattr(result, 'errno') and result.errno == 0:
+                                        self.log(f"   ✅ {pos_type} 성공", "SUCCESS", "trade")
+                                        total_success += 1
+                                    else:
+                                        self.log(f"   ❌ {pos_type} 실패", "ERROR", "trade")
+                                        total_fail += 1
+                                except Exception as e:
+                                    self.log(f"   ❌ {pos_type} 에러: {e}", "ERROR", "trade")
+                                    total_fail += 1
+
+                                time.sleep(0.5)
+
+                self.log(f"\n🏁 완료 - 성공: {total_success}, 실패: {total_fail}", "INFO", "trade")
+                messagebox.showinfo("완료", f"거래 완료\n성공: {total_success}, 실패: {total_fail}")
+
+            except Exception as e:
+                self.log(f"❌ 거래 실패: {e}", "ERROR", "trade")
+            finally:
+                self.trade_btn.config(state=NORMAL)
+
+        threading.Thread(target=trade, daemon=True).start()
+
+
+def main():
+    root = Tk()
+    app = OpinionTradeBot(root)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()
