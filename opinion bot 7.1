@@ -1,0 +1,600 @@
+"""
+Opinion Volume Bot v7.1 (Smart Adoption & Partial Fill Support)
+===============================================================
+LOGIC UPDATE:
+1. No Blind Cancel: '/sellall' NO LONGER cancels orders upon start. It simply enables management.
+2. Order Adoption: The bot checks for existing orders.
+   - If an order exists AND price is Best Ask -> IT HOLDS IT. (Preserves Queue Priority & Partial Fills)
+   - If price is pushed -> Cancels & Replaces.
+3. Fallback Safety: Only if 'place_order' fails with 'Insufficient Balance' does it trigger a force unlock.
+"""
+
+import os
+import json
+import time
+import threading
+import logging
+from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_DOWN
+from enum import Enum
+from typing import Optional, Dict, Any, List
+from queue import Queue, Empty
+
+# ============================================================
+# 0. Environment & Config
+# ============================================================
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError: pass
+
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except: pass
+
+try:
+    import certifi
+    os.environ["SSL_CERT_FILE"] = certifi.where()
+    os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+except ImportError: pass
+
+CONFIG = {
+    "HOST": "https://proxy.opinion.trade:8443",
+    "API_KEY": os.getenv("OPINION_API_KEY"),
+    "CHAIN_ID": 56,
+    "RPC_URL": os.getenv("OPINION_RPC_URL", "https://bsc-dataseed.binance.org"),
+    "PRIVATE_KEY": os.getenv("OPINION_PRIVATE_KEY"),
+    "MULTI_SIG_ADDR": os.getenv("OPINION_MULTI_SIG_ADDR"),
+    "CONDITIONAL_TOKENS_ADDR": "0xAD1a38cEc043e70E83a3eC30443dB285ED10D774",
+    "MULTISEND_ADDR": "0x998739BFdAAdde7C933B942a68053933098f9EDa",
+    "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
+    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
+
+    "CHECK_INTERVAL": 3.0,
+    "MIN_ORDER_SIZE": Decimal("1"),
+    "MIN_VALUE_USDT": Decimal("1.5"),
+    "PRICE_QUANT": Decimal("0.001"),
+    "MAKER_ONLY_GUARD": True,
+    "UNLOCK_COOLDOWN": 5.0,
+
+    "API_MAX_RETRIES": 3,
+    "API_RETRY_DELAY_BASE": 1.0,
+    "STATE_FILE": "opinion_bot_v7_state.json",
+}
+
+logging.basicConfig(level=logging.ERROR)
+
+# SDK Check
+try:
+    from opinion_clob_sdk import Client
+    from opinion_clob_sdk.model import TopicStatusFilter
+    from opinion_clob_sdk.chain.py_order_utils.model.order import PlaceOrderDataInput
+    from opinion_clob_sdk.chain.py_order_utils.model.sides import OrderSide
+    from opinion_clob_sdk.chain.py_order_utils.model.order_type import LIMIT_ORDER
+    SDK_AVAILABLE = True
+except ImportError:
+    SDK_AVAILABLE = False
+
+try:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
+    from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+
+
+# ============================================================
+# 1. Utilities
+# ============================================================
+def q_price(p: Decimal) -> Decimal:
+    return p.quantize(CONFIG["PRICE_QUANT"], rounding=ROUND_DOWN)
+
+def safe_decimal(x) -> Optional[Decimal]:
+    if x is None: return None
+    try:
+        s = str(x).replace(",", "")
+        return Decimal(s)
+    except: return None
+
+def obj_to_dict(obj: Any) -> Any:
+    if hasattr(obj, "model_dump"): return obj.model_dump()
+    if hasattr(obj, "__dict__"): return obj.__dict__
+    return obj
+
+class TelegramLogger:
+    def __init__(self):
+        self._bot = None
+        self._chat_id = None
+        self._queue = Queue()
+        self._running = False
+        
+    def setup(self, token, chat_id):
+        if TELEGRAM_AVAILABLE and token and chat_id:
+            self._bot = Bot(token=token)
+            self._chat_id = chat_id
+            self._running = True
+            threading.Thread(target=self._sender_loop, daemon=True).start()
+
+    def log(self, msg: str):
+        if self._running: self._queue.put(msg)
+
+    def _sender_loop(self):
+        buf = []
+        last_send = time.time()
+        while self._running:
+            try:
+                try:
+                    msg = self._queue.get(timeout=1.0)
+                    buf.append(msg)
+                except Empty: pass
+                
+                if buf and (time.time() - last_send >= 2.0 or len(buf) >= 5):
+                    text = "\n".join(buf[-15:])
+                    try: self._bot.send_message(chat_id=self._chat_id, text=text[:4000])
+                    except: pass
+                    buf = []
+                    last_send = time.time()
+            except: pass
+    
+    def stop(self): self._running = False
+
+tg_log = TelegramLogger()
+
+
+# ============================================================
+# 2. Models
+# ============================================================
+@dataclass
+class MarketInfo:
+    market_id: int
+    title: str
+    yes_token_id: str
+    no_token_id: str
+
+@dataclass
+class SessionState:
+    market: MarketInfo
+    total_budget: str = "0"
+    yes_budget: str = "0"
+    no_budget: str = "0"
+    
+    yes_position: str = "0"
+    no_position: str = "0"
+    
+    # Active Order Tracking
+    active_yes_order_id: Optional[str] = None
+    active_yes_price: Optional[str] = None
+    
+    active_no_order_id: Optional[str] = None
+    active_no_price: Optional[str] = None
+    
+    is_running: bool = False
+    last_unlock_time: float = 0.0
+
+
+# ============================================================
+# 3. Client Wrapper
+# ============================================================
+class OpinionClient:
+    def __init__(self):
+        if not SDK_AVAILABLE: raise RuntimeError("SDK missing")
+        self.client = Client(
+            host=CONFIG["HOST"],
+            apikey=CONFIG["API_KEY"],
+            chain_id=CONFIG["CHAIN_ID"],
+            rpc_url=CONFIG["RPC_URL"],
+            private_key=CONFIG["PRIVATE_KEY"],
+            multi_sig_addr=CONFIG["MULTI_SIG_ADDR"],
+            market_cache_ttl=60
+        )
+        try: self.client.enable_trading()
+        except: pass
+
+    def _retry(self, func, *args, **kwargs):
+        for i in range(CONFIG["API_MAX_RETRIES"] + 1):
+            try: return func(*args, **kwargs)
+            except Exception as e:
+                if i == CONFIG["API_MAX_RETRIES"]: raise e
+                time.sleep(1.0)
+
+    def _unwrap(self, resp):
+        if hasattr(resp, "errno"): return resp.errno, getattr(resp, "result", None), resp.errmsg
+        return 999, None, "Unknown"
+
+    def get_markets(self, page=1, limit=20):
+        try:
+            resp = self._retry(self.client.get_markets, page=page, limit=limit, status=TopicStatusFilter.ACTIVATED)
+            errno, res, _ = self._unwrap(resp)
+            if errno != 0: return []
+            raw_list = getattr(res, "list", []) or []
+            markets = []
+            for r in raw_list:
+                d = obj_to_dict(r)
+                sub = d.get("child_markets") or d.get("childMarkets") or []
+                markets.append(MarketInfo(
+                    market_id=int(d.get("market_id") or d.get("marketId") or 0),
+                    title=d.get("market_title") or d.get("marketTitle") or "",
+                    yes_token_id=d.get("yes_token_id") or d.get("yesTokenId") or "",
+                    no_token_id=d.get("no_token_id") or d.get("noTokenId") or ""
+                ))
+            return markets
+        except: return []
+
+    def get_market(self, mid: int):
+        try:
+            resp = self._retry(self.client.get_market, mid)
+            errno, res, _ = self._unwrap(resp)
+            if errno != 0: return None
+            d = obj_to_dict(getattr(res, "data", res))
+            return MarketInfo(
+                market_id=int(d.get("market_id") or mid),
+                title=d.get("market_title") or d.get("title") or "",
+                yes_token_id=d.get("yes_token_id") or d.get("yesTokenId") or "",
+                no_token_id=d.get("no_token_id") or d.get("noTokenId") or ""
+            )
+        except: return None
+
+    def get_best_prices(self, tid):
+        try:
+            resp = self._retry(self.client.get_orderbook, tid)
+            errno, res, _ = self._unwrap(resp)
+            if errno != 0: return None, None
+            bids = getattr(res, "bids", []) or []
+            asks = getattr(res, "asks", []) or []
+            bb = Decimal(str(bids[0].price)) if bids else None
+            ba = Decimal(str(asks[0].price)) if asks else None
+            return bb, ba
+        except: return None, None
+
+    def get_my_positions(self, limit=100):
+        try:
+            resp = self._retry(self.client.get_my_positions, limit=limit)
+            errno, res, _ = self._unwrap(resp)
+            if errno != 0: return []
+            d = obj_to_dict(res)
+            if isinstance(d, list): return d
+            if isinstance(d, dict):
+                for k in ["list", "data", "items"]:
+                    if d.get(k) and isinstance(d[k], list): return obj_to_dict(d[k])
+            return []
+        except: return []
+
+    def get_my_open_orders(self, mid):
+        all_orders = []
+        page = 1
+        limit = 50
+        while True:
+            try:
+                resp = self._retry(self.client.get_my_orders, market_id=mid, page=page, limit=limit)
+                errno, res, _ = self._unwrap(resp)
+                if errno != 0: break
+                d = obj_to_dict(res)
+                raw = []
+                if isinstance(d, list): raw = d
+                elif isinstance(d, dict):
+                    for k in ["list", "data"]:
+                        if d.get(k): raw = d[k]; break
+                if not raw: break
+                for r in raw:
+                    st = str(r.get("status") or "").upper()
+                    if "OPEN" in st or "PENDING" in st:
+                        all_orders.append(r)
+                if len(raw) < limit: break
+                page += 1
+            except: break
+        return all_orders
+
+    def place_order(self, mid, tid, is_buy, price, amount, is_quote):
+        try:
+            order = PlaceOrderDataInput(
+                marketId=mid, tokenId=tid, side=OrderSide.BUY if is_buy else OrderSide.SELL,
+                orderType=LIMIT_ORDER, price=str(price)
+            )
+            if is_quote: order.makerAmountInQuoteToken = float(amount)
+            else: order.makerAmountInBaseToken = float(amount)
+            resp = self._retry(self.client.place_order, order, check_approval=True)
+            errno, res, err = self._unwrap(resp)
+            if errno != 0: return None, err
+            d = obj_to_dict(res)
+            oid = d.get("order_id") or d.get("orderId") or (d.get("orderData") or {}).get("orderId")
+            return oid, None
+        except Exception as e:
+            return None, str(e)
+
+    def cancel_order(self, oid):
+        try:
+            self.client.cancel_order(oid)
+            return True
+        except: return False
+
+    def cancel_all_orders(self, mid):
+        try:
+            self.client.cancel_all_orders(mid)
+            return True
+        except: return False
+
+
+# ============================================================
+# 4. Strategy Manager (Smart Adoption)
+# ============================================================
+class StrategyManager:
+    def __init__(self):
+        self.client = None
+        self.sessions: Dict[int, SessionState] = {}
+        self._lock = threading.RLock()
+        self._running = False
+        
+    def initialize(self):
+        try:
+            self.client = OpinionClient()
+            if os.path.exists(CONFIG["STATE_FILE"]):
+                try: os.remove(CONFIG["STATE_FILE"])
+                except: pass
+            return True
+        except: return False
+
+    def start_loop(self):
+        self._running = True
+        threading.Thread(target=self._main_loop, daemon=True).start()
+
+    def _main_loop(self):
+        while self._running:
+            try:
+                with self._lock:
+                    mids = list(self.sessions.keys())
+                
+                # Global Position Update
+                all_positions = self.client.get_my_positions(limit=100)
+                for p in all_positions:
+                    mid = int(p.get("market_id") or p.get("marketId") or 0)
+                    if mid in self.sessions:
+                        self._update_session_pos(mid, p)
+
+                for mid in mids:
+                    s = self.sessions.get(mid)
+                    if not s or not s.is_running: continue
+                    
+                    if time.time() - s.last_unlock_time < CONFIG["UNLOCK_COOLDOWN"]:
+                        continue
+
+                    self._execute_market_logic(s)
+                
+                time.sleep(CONFIG["CHECK_INTERVAL"])
+            except Exception as e:
+                time.sleep(5)
+
+    def _update_session_pos(self, mid, p):
+        s = self.sessions[mid]
+        tid = str(p.get("token_id") or p.get("tokenId"))
+        amt = safe_decimal(p.get("shares_owned") or p.get("amount") or 0) or Decimal(0)
+        if amt > 1_000_000_000: amt /= Decimal(10**18)
+        
+        outcome = str(p.get("outcome") or "").upper()
+        if outcome == "YES": s.yes_position = str(amt)
+        elif outcome == "NO": s.no_position = str(amt)
+        else:
+            if tid == s.market.yes_token_id: s.yes_position = str(amt)
+            elif tid == s.market.no_token_id: s.no_position = str(amt)
+
+    def _execute_market_logic(self, s: SessionState):
+        # 1. Fetch Orders (Truth Source)
+        open_orders = self.client.get_my_open_orders(s.market.market_id)
+        
+        s.active_yes_order_id = None
+        s.active_yes_price = None
+        s.active_no_order_id = None
+        s.active_no_price = None
+        
+        for o in open_orders:
+            tid = str(o.get("token_id") or o.get("tokenId"))
+            oid = str(o.get("order_id") or o.get("orderId"))
+            price = str(o.get("price"))
+            
+            if tid == s.market.yes_token_id:
+                s.active_yes_order_id, s.active_yes_price = oid, price
+            elif tid == s.market.no_token_id:
+                s.active_no_order_id, s.active_no_price = oid, price
+
+        # 2. Manage Sell Sides
+        self._manage_side(s, "YES", s.market.yes_token_id, s.yes_position, s.active_yes_order_id, s.active_yes_price)
+        self._manage_side(s, "NO", s.market.no_token_id, s.no_position, s.active_no_order_id, s.active_no_price)
+
+    def _manage_side(self, s, side_name, tid, pos_str, active_oid, active_price):
+        pos = Decimal(pos_str)
+        if pos < CONFIG["MIN_ORDER_SIZE"]: return 
+
+        bb, ba = self.client.get_best_prices(tid)
+        if ba is None: return 
+
+        target_price = q_price(ba)
+        # Dust check
+        if (pos * target_price) < CONFIG["MIN_VALUE_USDT"]: return
+
+        # CASE 1: Order Exists -> CHECK PRICE
+        if active_oid:
+            current_order_price = q_price(Decimal(active_price))
+            if current_order_price == target_price:
+                # ✅ Perfect. Do nothing. (Preserves Queue Priority)
+                return
+            else:
+                # Price pushed. Cancel.
+                tg_log.log(f"📉 {side_name} Pushed #{s.market.market_id}: {current_order_price} -> {target_price}")
+                self.client.cancel_order(active_oid)
+            return
+
+        # CASE 2: No Order -> PLACE NEW
+        if CONFIG["MAKER_ONLY_GUARD"] and bb and bb >= target_price: return
+
+        oid, err = self.client.place_order(s.market.market_id, tid, False, target_price, pos, False)
+        
+        if oid:
+            tg_log.log(f"📤 {side_name} SELL #{s.market.market_id}: {pos:.2f} @ {target_price}")
+        elif err and "Insufficient" in str(err):
+            # Fallback: We checked orders but still failed? Real ghost lock.
+            tg_log.log(f"🔓 Force Unlocking #{s.market.market_id} (Sync Mismatch)")
+            self.client.cancel_all_orders(s.market.market_id)
+            s.last_unlock_time = time.time()
+
+    def trigger_sell_all(self):
+        tg_log.log("🚨 TRIGGERING SELL ALL...")
+        positions = self.client.get_my_positions(limit=100)
+        
+        if not positions:
+            tg_log.log("✅ No positions found.")
+            return
+        
+        count = 0
+        with self._lock:
+            for p in positions:
+                mid = int(p.get("market_id") or p.get("marketId") or 0)
+                if mid == 0: continue
+                
+                val = safe_decimal(p.get("current_value_in_quote_token") or 0) or Decimal(0)
+                if val < CONFIG["MIN_VALUE_USDT"]: continue
+
+                # Register Session
+                if mid not in self.sessions:
+                    m = self.client.get_market(mid)
+                    if not m: continue
+                    self.sessions[mid] = SessionState(
+                        market=m, total_budget="0", yes_budget="0", no_budget="0"
+                    )
+                
+                s = self.sessions[mid]
+                # 🚨 UPDATE: DO NOT CANCEL HERE. Just enable management.
+                s.is_running = True
+                count += 1
+                
+        tg_log.log(f"✅ Sell All Enabled for {count} markets. Adopting existing orders...")
+
+
+# ============================================================
+# 5. Telegram
+# ============================================================
+class TelegramBot:
+    def __init__(self, mgr):
+        self.mgr = mgr
+        tg_log.setup(CONFIG["TELEGRAM_BOT_TOKEN"], CONFIG["TELEGRAM_CHAT_ID"])
+        self.updater = Updater(token=CONFIG["TELEGRAM_BOT_TOKEN"], use_context=True)
+        dp = self.updater.dispatcher
+        
+        dp.add_handler(CommandHandler("start", self.start))
+        dp.add_handler(CommandHandler("help", self.help))
+        dp.add_handler(CommandHandler("markets", self.markets))
+        dp.add_handler(CommandHandler("market", self.market))
+        dp.add_handler(CommandHandler("position", self.position))
+        dp.add_handler(CommandHandler("sellall", self.sellall))
+        dp.add_handler(CommandHandler("kill", self.kill))
+        dp.add_handler(CallbackQueryHandler(self.page_callback, pattern=r"^p_"))
+        self._markets_cache = []
+        self.updater.start_polling()
+
+    def _auth(self, u): return str(u.effective_chat.id) == str(CONFIG["TELEGRAM_CHAT_ID"])
+
+    def start(self, u, c):
+        if self._auth(u): u.message.reply_text("🤖 Opinion Bot v7.1 Ready")
+
+    def help(self, u, c):
+        if not self._auth(u): return
+        u.message.reply_text("/markets, /market <id>, /position, /sellall, /kill")
+
+    def markets(self, u, c):
+        if not self._auth(u): return
+        u.message.reply_text("🔄 Fetching...")
+        self._markets_cache = []
+        page = 1
+        while True:
+            ms = self.mgr.client.get_markets(page=page, limit=20)
+            if not ms: break
+            self._markets_cache.extend(ms)
+            if len(ms) < 20: break
+            page += 1
+        if not self._markets_cache: return u.message.reply_text("❌ None")
+        text, kb = self._format_page(0)
+        u.message.reply_text(text, reply_markup=kb)
+
+    def _format_page(self, page):
+        per = 10
+        total = len(self._markets_cache)
+        max_p = (total + per - 1) // per
+        start = page * per
+        end = min(start + per, total)
+        txt = f"📊 Markets ({page+1}/{max_p})\n"
+        for m in self._markets_cache[start:end]: txt += f"[{m.market_id}] {m.title[:30]}\n"
+        btns = []
+        if page > 0: btns.append(InlineKeyboardButton("⬅️", callback_data=f"p_{page-1}"))
+        if page < max_p - 1: btns.append(InlineKeyboardButton("➡️", callback_data=f"p_{page+1}"))
+        return txt, InlineKeyboardMarkup([btns]) if btns else None
+
+    def page_callback(self, u, c):
+        q = u.callback_query
+        if not self._auth(u): return
+        q.answer()
+        try:
+            page = int(q.data.split("_")[1])
+            t, k = self._format_page(page)
+            q.edit_message_text(t, reply_markup=k)
+        except: pass
+
+    def market(self, u, c):
+        if not self._auth(u): return
+        try:
+            mid = int(c.args[0])
+            m = self.mgr.client.get_market(mid)
+            if not m: return u.message.reply_text("❌ Not found")
+            txt = f"📝 #{m.market_id} {m.title}\nVol: ${m.volume:,.2f}"
+            if m.sub_markets:
+                txt += "\nOptions:"
+                for s in m.sub_markets[:10]:
+                    sid = s.get('market_id') if isinstance(s, dict) else getattr(s, 'outcome_id', 'N/A')
+                    stitle = s.get('market_title') if isinstance(s, dict) else getattr(s, 'name', 'N/A')
+                    txt += f"\n [{sid}] {stitle}"
+            u.message.reply_text(txt)
+        except: u.message.reply_text("/market <id>")
+
+    def position(self, u, c):
+        if not self._auth(u): return
+        u.message.reply_text("🔍 Fetching...")
+        pos = self.mgr.client.get_my_positions(limit=100)
+        if not pos: return u.message.reply_text("✅ No positions")
+        msg = "🎒 Holdings:\n"
+        for p in pos:
+            try:
+                mid = int(p.get("market_id") or 0)
+                if mid == 0: continue
+                shares = safe_decimal(p.get("shares_owned") or p.get("amount") or 0)
+                val = safe_decimal(p.get("current_value_in_quote_token") or 0)
+                if val < 0.1: continue
+                outcome = p.get("outcome") or "?"
+                msg += f"\n#{mid} {p.get('market_title', '')[:15]}...\n   {outcome}: {shares:.1f} (${val:.2f})\n"
+            except: pass
+        u.message.reply_text(msg[:4000])
+
+    def sellall(self, u, c):
+        if not self._auth(u): return
+        u.message.reply_text("🔥 SELL ALL Initiated")
+        self.mgr.trigger_sell_all()
+
+    def kill(self, u, c):
+        if not self._auth(u): return
+        u.message.reply_text("🚨 KILL")
+        with self.mgr._lock:
+            for mid, s in self.mgr.sessions.items():
+                s.is_running = False
+                self.mgr.client.cancel_all_orders(mid)
+        u.message.reply_text("🛑 Done")
+
+
+if __name__ == "__main__":
+    if not CONFIG["API_KEY"]:
+        print("❌ Config Missing")
+    else:
+        print("🚀 Bot v7.1 Started")
+        mgr = StrategyManager()
+        if mgr.initialize():
+            mgr.start_loop()
+            tg = TelegramBot(mgr)
+            try:
+                while True: time.sleep(10)
+            except KeyboardInterrupt: print("🛑 Off")
