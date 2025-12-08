@@ -1,0 +1,6491 @@
+Opinion Volume Bot v4.3
+
+=======================
+
+v4.2 기반 + multi-outcome 마켓 파싱 개선:
+
+
+
+1. 매수가 추적: 각 사이드별 평균 매수가 기록
+
+2. 최대 손실 틱 제한: best_ask < avg_buy_price - MAX_LOSS_TICKS 이면 매도 거부
+
+3. 세션 손실 한도: 총 손실이 예산의 X% 초과하면 자동 중단
+
+4. 급락 감지: 이전 체크 대비 급락 시 경고
+
+5. HTTP 재시도: 504, 502, 타임아웃 등 일시적 오류 자동 재시도 (지수 백오프)
+
+6. 클라이언트 재초기화: 연속 오류 시 자동 재연결
+
+7. ⭐ multi-outcome 마켓 지원 강화: 다양한 API 필드명 지원 및 정확한 볼륨 집계
+
+
+
+v4.3 개선사항:
+
+- get_market(): marketOptions, market_options 등 다양한 필드명 지원
+
+- 하위 마켓 볼륨 자동 합산으로 정확한 총 볼륨 표시
+
+- /raw 명령어 개선: outcomes 상세 정보 더 명확하게 표시
+
+- 토큰 ID, 타이틀 등 다양한 필드명 변형 지원
+
+
+
+공격 시나리오 방지:
+
+- 공격자가 호가를 인위적으로 조작해서 손해보는 가격에 물량 떠넘기기 시도
+
+- → 매수가 대비 손실이 임계값 초과하면 매도 거부 + 알림 + 사이드 일시정지
+
+"""
+
+
+
+# ============================================================
+
+# SSL 인증서 설정
+
+# ============================================================
+
+import os
+
+try:
+
+    import certifi
+
+    os.environ["SSL_CERT_FILE"] = certifi.where()
+
+    os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
+except ImportError:
+
+    pass
+
+
+
+# ============================================================
+
+# packages
+
+# ============================================================
+
+import json
+
+import time
+
+import threading
+
+import logging
+
+from dataclasses import dataclass, asdict, field
+
+from decimal import Decimal, ROUND_DOWN
+
+from enum import Enum
+
+from typing import Optional, Dict, Any, List, Tuple
+
+from queue import Queue, Empty
+
+from collections import deque
+
+
+
+# ============================================================
+
+# env
+
+# ============================================================
+
+try:
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+except ImportError:
+
+    pass
+
+
+
+try:
+
+    import nest_asyncio
+
+    nest_asyncio.apply()
+
+except:
+
+    pass
+
+
+
+# ============================================================
+
+# config
+
+# ============================================================
+
+CONFIG = {
+
+    "HOST": "https://proxy.opinion.trade:8443",
+
+    "API_KEY": os.getenv("OPINION_API_KEY"),
+
+    "CHAIN_ID": 56,
+
+    "RPC_URL": os.getenv("OPINION_RPC_URL", "https://bsc-dataseed.binance.org"),
+
+    "PRIVATE_KEY": os.getenv("OPINION_PRIVATE_KEY"),
+
+    "MULTI_SIG_ADDR": os.getenv("OPINION_MULTI_SIG_ADDR"),
+
+    "CONDITIONAL_TOKENS_ADDR": "0xAD1a38cEc043e70E83a3eC30443dB285ED10D774",
+
+    "MULTISEND_ADDR": "0x998739BFdAAdde7C933B942a68053933098f9EDa",
+
+
+
+    "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
+
+    "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
+
+
+
+    "CHECK_INTERVAL": 3.0,  # 렉 감소를 위해 2.0 → 3.0초로 조정
+
+    "MIN_ORDER_SIZE": Decimal("1"),
+
+
+
+    # quantization
+
+    "PRICE_QUANT": Decimal("0.001"),
+
+
+
+    # soft post-only guard
+
+    "MAKER_ONLY_GUARD": True,
+
+    "GUARD_LOG_THROTTLE_SEC": 8.0,
+
+
+
+    # ============================================================
+
+    # 🛡️ 손실 보호 설정 (NEW)
+
+    # ============================================================
+
+    # 최대 손실 틱: best_ask가 avg_buy_price - MAX_LOSS_TICKS * PRICE_QUANT 미만이면 매도 거부
+
+    # 예: 5틱 = 0.005 = 0.5¢
+
+    "MAX_LOSS_TICKS": 5,
+
+    
+
+    # 세션 최대 손실률: 총 손실이 예산의 X% 초과하면 세션 자동 중단
+
+    # 예: 0.20 = 20%
+
+    "MAX_SESSION_LOSS_RATE": 0.20,
+
+    
+
+    # 급락 감지 틱: 이전 best_ask 대비 N틱 이상 급락하면 경고
+
+    "PRICE_DROP_ALERT_TICKS": 10,
+
+    
+
+    # 보호 발동 시 동작: "pause" = 해당 사이드만 일시정지, "stop" = 세션 전체 중단
+
+    "PROTECTION_ACTION": "pause",
+
+    
+
+    # ============================================================
+
+    # 💰 예산 배분 설정
+
+    # ============================================================
+
+    # "fixed" = 50:50 고정, "dynamic" = 가격/유동성 기반 동적 배분
+
+    "BUDGET_ALLOCATION_MODE": "dynamic",
+
+    "DYNAMIC_RATIO_MIN": Decimal("0.30"),  # 최소 30%
+
+    "DYNAMIC_RATIO_MAX": Decimal("0.70"),  # 최대 70%
+
+    # ============================================================
+
+
+
+    # fee
+
+    "DEFAULT_MAKER_FEE_RATE": Decimal("0.00"),
+
+    "DEFAULT_TAKER_FEE_RATE": Decimal("0.02"),
+
+
+
+    # persistence
+
+    "STATE_FILE": "opinion_volume_bot_state.json",
+
+    "STATE_SAVE_MIN_INTERVAL_SEC": 5.0,  # 파일 저장 오류 방지
+
+
+
+    # trade dedupe
+
+    "TRADE_DEDUPE_MAX": 5000,
+
+
+
+    # filled epsilon
+
+    "FILLED_EPS": Decimal("0.0000001"),
+
+
+
+    # kill sweep
+
+    "KILL_MARKET_PAGE_LIMIT": 20,
+
+    "KILL_MAX_PAGES": 200,
+
+    
+
+    # ============================================================
+
+    # 🔄 HTTP 재시도 설정
+
+    # ============================================================
+
+    "API_MAX_RETRIES": 5,           # 최대 재시도 횟수 (3 → 5)
+
+    "API_RETRY_DELAY_BASE": 2.0,    # 기본 대기 시간 (초) (1.0 → 2.0)
+
+    "API_RETRY_DELAY_MAX": 15.0,    # 최대 대기 시간 (초) (10.0 → 15.0)
+
+    "API_TIMEOUT": 60,              # 타임아웃 (초) (30 → 60)
+
+    "CONSECUTIVE_ERROR_LIMIT": 10,  # 연속 오류 허용 횟수 (5 → 10)
+
+}
+
+
+
+def check_env() -> bool:
+
+    required = ["API_KEY", "PRIVATE_KEY", "MULTI_SIG_ADDR", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+
+    ok = True
+
+    for k in required:
+
+        if not CONFIG.get(k):
+
+            print(f"❌ {k}: NOT LOADED")
+
+            ok = False
+
+    if ok:
+
+        print("✅ 환경변수 로드 완료")
+
+    return ok
+
+
+
+ENV_OK = check_env()
+
+
+
+# ============================================================
+
+# Logging 설정
+
+# ============================================================
+
+logging.basicConfig(
+
+    level=logging.WARNING,
+
+    format="%(asctime)s [%(levelname)s] %(message)s",
+
+    datefmt="%H:%M:%S",
+
+)
+
+logger = logging.getLogger(__name__)
+
+logger.setLevel(logging.INFO)
+
+
+
+# SDK, urllib3, requests 로그 억제 (504 에러 로그 스팸 방지)
+
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+
+logging.getLogger("requests").setLevel(logging.ERROR)
+
+logging.getLogger("opinion_clob_sdk").setLevel(logging.ERROR)
+
+logging.getLogger("websocket").setLevel(logging.ERROR)
+
+
+
+# ============================================================
+
+# SDK import
+
+# ============================================================
+
+try:
+
+    from opinion_clob_sdk import Client
+
+    from opinion_clob_sdk.model import TopicStatusFilter, TopicStatus
+
+    from opinion_clob_sdk.chain.py_order_utils.model.order import PlaceOrderDataInput
+
+    from opinion_clob_sdk.chain.py_order_utils.model.sides import OrderSide
+
+    from opinion_clob_sdk.chain.py_order_utils.model.order_type import LIMIT_ORDER
+
+    SDK_AVAILABLE = True
+
+except ImportError:
+
+    SDK_AVAILABLE = False
+
+    print("❌ opinion-clob-sdk not installed")
+
+
+
+try:
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
+
+    from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
+
+    TELEGRAM_AVAILABLE = True
+
+except ImportError:
+
+    TELEGRAM_AVAILABLE = False
+
+    print("⚠️ python-telegram-bot not installed")
+
+
+
+# ============================================================
+
+# Telegram logger
+
+# ============================================================
+
+class TelegramLogger:
+
+    def __init__(self):
+
+        self._bot: Optional[Bot] = None
+
+        self._chat_id: Optional[str] = None
+
+        self._queue: Queue = Queue()
+
+        self._thread: Optional[threading.Thread] = None
+
+        self._running = False
+
+
+
+    def setup(self, bot_token: str, chat_id: str):
+
+        if TELEGRAM_AVAILABLE and bot_token and chat_id:
+
+            self._bot = Bot(token=bot_token)
+
+            self._chat_id = chat_id
+
+            self._running = True
+
+            self._thread = threading.Thread(target=self._sender_loop, daemon=True)
+
+            self._thread.start()
+
+
+
+    def _sender_loop(self):
+
+        buf: List[str] = []
+
+        last_send = time.time()
+
+        while self._running:
+
+            try:
+
+                try:
+
+                    msg = self._queue.get(timeout=0.5)
+
+                    buf.append(msg)
+
+                except Empty:
+
+                    pass
+
+
+
+                if buf and ((time.time() - last_send) >= 1.0 or len(buf) >= 10):
+
+                    text = "\n".join(buf[-20:])
+
+                    if len(text) > 4000:
+
+                        text = text[-4000:]
+
+                    try:
+
+                        self._bot.send_message(chat_id=self._chat_id, text=text, parse_mode=None)
+
+                    except:
+
+                        pass
+
+                    buf.clear()
+
+                    last_send = time.time()
+
+            except:
+
+                pass
+
+
+
+    def log(self, message: str):
+
+        ts = time.strftime("%H:%M:%S")
+
+        self._queue.put(f"[{ts}] {message}")
+
+
+
+    def stop(self):
+
+        self._running = False
+
+
+
+tg_logger = TelegramLogger()
+
+
+
+def tg_log(msg: str):
+
+    tg_logger.log(msg)
+
+
+
+# ============================================================
+
+# utils
+
+# ============================================================
+
+Q_PRICE = CONFIG["PRICE_QUANT"]
+
+
+
+def q_price(p: Decimal) -> Decimal:
+
+    return p.quantize(Q_PRICE, rounding=ROUND_DOWN)
+
+
+
+def safe_decimal(x) -> Optional[Decimal]:
+
+    if x is None:
+
+        return None
+
+    try:
+
+        if isinstance(x, Decimal):
+
+            return x
+
+        if isinstance(x, (int, float)):
+
+            return Decimal(str(x))
+
+        s = str(x).strip()
+
+        if not s:
+
+            return None
+
+        return Decimal(s)
+
+    except:
+
+        return None
+
+
+
+def obj_to_dict(obj: Any) -> Any:
+
+    if obj is None:
+
+        return None
+
+    if isinstance(obj, dict):
+
+        return obj
+
+    if isinstance(obj, (list, tuple)):
+
+        return [obj_to_dict(x) for x in obj]
+
+    if hasattr(obj, "model_dump"):
+
+        try:
+
+            return obj.model_dump()
+
+        except:
+
+            pass
+
+    if hasattr(obj, "__dict__"):
+
+        try:
+
+            d = {}
+
+            for k, v in obj.__dict__.items():
+
+                if k.startswith("_"):
+
+                    continue
+
+                d[k] = obj_to_dict(v)
+
+            return d
+
+        except:
+
+            pass
+
+    return obj
+
+
+
+def ensure_dir_for_file(path: str):
+
+    parent = os.path.dirname(os.path.abspath(path))
+
+    if parent and not os.path.exists(parent):
+
+        os.makedirs(parent, exist_ok=True)
+
+
+
+def _json_default(obj: Any):
+
+    """json.dump() fallback serializer.
+
+
+
+    - Decimal -> string (keeps precision)
+
+    - Enum -> value
+
+    - dataclass / pydantic -> dict
+
+    - set -> list
+
+    """
+
+    try:
+
+        if isinstance(obj, Decimal):
+
+            return str(obj)
+
+        if isinstance(obj, Enum):
+
+            return obj.value
+
+        if isinstance(obj, (set, frozenset)):
+
+            return list(obj)
+
+        if hasattr(obj, "__dataclass_fields__"):
+
+            return {k: getattr(obj, k) for k in obj.__dataclass_fields__.keys()}
+
+        if hasattr(obj, "model_dump"):
+
+            return obj.model_dump()
+
+        if hasattr(obj, "__dict__"):
+
+            d = {}
+
+            for k, v in obj.__dict__.items():
+
+                if not str(k).startswith("_"):
+
+                    d[k] = v
+
+            return d
+
+    except Exception:
+
+        pass
+
+    return str(obj)
+
+
+
+def atomic_write_json(path: str, data: Dict[str, Any]):
+
+    """
+
+    Windows 호환 atomic write - 강력한 버전
+
+    - Unique 임시 파일명 (PID + timestamp)
+
+    - 재시도 로직 강화
+
+    - 실패 시 직접 쓰기 fallback
+
+    """
+
+    ensure_dir_for_file(path)
+
+    
+
+    # Unique 임시 파일명 (충돌 방지)
+
+    import random
+
+    tmp_suffix = f".tmp.{os.getpid()}.{int(time.time()*1000)}.{random.randint(1000,9999)}"
+
+    tmp = path + tmp_suffix
+
+    
+
+    # 1. 임시 파일 쓰기
+
+    try:
+
+        with open(tmp, "w", encoding="utf-8") as f:
+
+            json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
+
+        # 파일 핸들 완전히 닫히도록 대기
+
+        time.sleep(0.05)
+
+    except Exception as e:
+
+        # 임시 파일 쓰기 실패
+
+        try:
+
+            if os.path.exists(tmp):
+
+                os.remove(tmp)
+
+        except:
+
+            pass
+
+        raise e
+
+    
+
+    # 2. Replace 시도 (최대 5번, 더 긴 간격)
+
+    last_error = None
+
+    for attempt in range(5):
+
+        try:
+
+            # 임시 파일이 여전히 존재하는지 확인
+
+            if not os.path.exists(tmp):
+
+                raise FileNotFoundError(f"Temporary file disappeared: {tmp}")
+
+            
+
+            # Windows: 대상 파일 삭제 시도
+
+            if os.name == 'nt' and os.path.exists(path):
+
+                try:
+
+                    os.remove(path)
+
+                    time.sleep(0.02)  # 삭제 완료 대기
+
+                except (PermissionError, OSError) as e:
+
+                    if attempt < 4:
+
+                        time.sleep(0.1 * (attempt + 1))
+
+                        continue
+
+                    # 마지막 시도에서도 실패하면 직접 쓰기로 fallback
+
+                    last_error = e
+
+                    break
+
+            
+
+            # Replace 실행
+
+            os.replace(tmp, path)
+
+            return  # 성공!
+
+            
+
+        except Exception as e:
+
+            last_error = e
+
+            if attempt < 4:
+
+                time.sleep(0.1 * (attempt + 1))
+
+            else:
+
+                break  # 마지막 시도 실패
+
+    
+
+    # 3. Fallback: 직접 쓰기 (atomic 포기)
+
+    try:
+
+        # 임시 파일 정리
+
+        if os.path.exists(tmp):
+
+            try:
+
+                os.remove(tmp)
+
+            except:
+
+                pass
+
+        
+
+        # 직접 쓰기 (덮어쓰기)
+
+        with open(path, "w", encoding="utf-8") as f:
+
+            json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
+
+        return  # Fallback 성공
+
+        
+
+    except Exception as fallback_error:
+
+        # 완전 실패
+
+        raise Exception(f"atomic_write failed: {last_error}, fallback failed: {fallback_error}")
+
+
+
+# ============================================================
+
+# models
+
+# ============================================================
+
+class BotState(Enum):
+
+    IDLE = "idle"
+
+    RUNNING = "running"
+
+    PAUSED = "paused"
+
+    STOPPING = "stopping"
+
+
+
+@dataclass
+
+class OrderInfo:
+
+    order_id: str
+
+    token_id: str
+
+    side: str          # "YES" or "NO"
+
+    is_buy: bool
+
+    price: str
+
+
+
+    total_quote: str = "0"
+
+    total_base: str = "0"
+
+    filled_quote: str = "0"
+
+    filled_base: str = "0"
+
+
+
+    status: str = "open"
+
+
+
+    def price_d(self) -> Decimal: return Decimal(self.price)
+
+    def total_quote_d(self) -> Decimal: return Decimal(self.total_quote)
+
+    def total_base_d(self) -> Decimal: return Decimal(self.total_base)
+
+    def filled_quote_d(self) -> Decimal: return Decimal(self.filled_quote)
+
+    def filled_base_d(self) -> Decimal: return Decimal(self.filled_base)
+
+
+
+    def add_fill(self, quote: Decimal, base: Decimal):
+
+        self.filled_quote = str(self.filled_quote_d() + quote)
+
+        self.filled_base = str(self.filled_base_d() + base)
+
+
+
+@dataclass
+
+class SubMarketInfo:
+
+    """하위 마켓 정보 (multi-outcome 마켓용)"""
+
+    outcome_id: int
+
+    name: str
+
+    token_id: str  # YES 토큰
+
+    no_token_id: str  # NO 토큰 (있는 경우)
+
+    volume: Decimal = Decimal("0")
+
+    chance: Decimal = Decimal("0")
+
+
+
+@dataclass
+
+class MarketInfo:
+
+    market_id: int
+
+    title: str
+
+    yes_token_id: str
+
+    no_token_id: str
+
+    status: int
+
+    volume: Decimal = Decimal("0")
+
+    sub_markets: List['SubMarketInfo'] = field(default_factory=list)
+
+
+
+@dataclass
+
+class Stats:
+
+    total_volume: str = "0"
+
+    total_trades: int = 0
+
+    buy_cost: str = "0"
+
+    sell_proceeds: str = "0"
+
+    total_fees: str = "0"
+
+    realized_pnl: str = "0"
+
+
+
+    def total_volume_d(self): return Decimal(self.total_volume)
+
+    def buy_cost_d(self): return Decimal(self.buy_cost)
+
+    def sell_proceeds_d(self): return Decimal(self.sell_proceeds)
+
+    def total_fees_d(self): return Decimal(self.total_fees)
+
+    def realized_pnl_d(self): return Decimal(self.realized_pnl)
+
+
+
+    def recompute_pnl(self):
+
+        self.realized_pnl = str(self.sell_proceeds_d() - self.buy_cost_d() - self.total_fees_d())
+
+
+
+@dataclass
+
+class SessionState:
+
+    market: MarketInfo
+
+
+
+    total_budget: str
+
+    yes_budget: str
+
+    no_budget: str
+
+
+
+    yes_position: str
+
+    no_position: str
+
+
+
+    yes_buy_order: Optional[OrderInfo] = None
+
+    no_buy_order: Optional[OrderInfo] = None
+
+    yes_sell_order: Optional[OrderInfo] = None
+
+    no_sell_order: Optional[OrderInfo] = None
+
+
+
+    stats: Stats = None
+
+    state: str = BotState.RUNNING.value
+
+
+
+    seen_trade_uids: List[str] = None
+
+
+
+    # ============================================================
+
+    # 🛡️ 손실 보호용 필드 (NEW)
+
+    # ============================================================
+
+    # 가중평균 매수가 (포지션이 있을 때만 유효)
+
+    yes_avg_buy_price: str = "0"
+
+    no_avg_buy_price: str = "0"
+
+    
+
+    # 총 매수 비용 (평균가 계산용)
+
+    yes_total_buy_cost: str = "0"
+
+    no_total_buy_cost: str = "0"
+
+    
+
+    # 사이드별 일시정지 (보호 발동 시)
+
+    yes_side_paused: bool = False
+
+    no_side_paused: bool = False
+
+    
+
+    # 마지막으로 본 best_ask (급락 감지용)
+
+    yes_last_best_ask: str = "0"
+
+    no_last_best_ask: str = "0"
+
+    
+
+    # 보호 발동 횟수
+
+    protection_triggered_count: int = 0
+
+
+
+    def __post_init__(self):
+
+        if self.stats is None:
+
+            self.stats = Stats()
+
+        if self.seen_trade_uids is None:
+
+            self.seen_trade_uids = []
+
+
+
+# ============================================================
+
+# client wrapper
+
+# ============================================================
+
+import random
+
+
+
+class OpinionClient:
+
+    def __init__(self):
+
+        if not SDK_AVAILABLE or not ENV_OK:
+
+            raise RuntimeError("SDK or ENV not ready")
+
+
+
+        self._init_client()
+
+        self._consecutive_errors = 0
+
+        self._last_error_time = 0.0
+
+
+
+    def _init_client(self):
+
+        """클라이언트 초기화/재초기화"""
+
+        self.client = Client(
+
+            host=CONFIG["HOST"],
+
+            apikey=CONFIG["API_KEY"],
+
+            chain_id=CONFIG["CHAIN_ID"],
+
+            rpc_url=CONFIG["RPC_URL"],
+
+            private_key=CONFIG["PRIVATE_KEY"],
+
+            multi_sig_addr=CONFIG["MULTI_SIG_ADDR"],
+
+            conditional_tokens_addr=CONFIG["CONDITIONAL_TOKENS_ADDR"],
+
+            multisend_addr=CONFIG["MULTISEND_ADDR"],
+
+            market_cache_ttl=60,
+
+            quote_tokens_cache_ttl=3600,
+
+        )
+
+        try:
+
+            if hasattr(self.client, "enable_trading"):
+
+                self.client.enable_trading()
+
+        except:
+
+            pass
+
+
+
+        self.maker_fee_rate = CONFIG["DEFAULT_MAKER_FEE_RATE"]
+
+        self.taker_fee_rate = CONFIG["DEFAULT_TAKER_FEE_RATE"]
+
+        self._best_effort_load_fee_rates()
+
+
+
+    def _is_retryable_error(self, e: Exception) -> bool:
+
+        """재시도 가능한 오류인지 판단"""
+
+        error_str = str(e).lower()
+
+        retryable_patterns = [
+
+            "504", "502", "503", "500",
+
+            "gateway", "timeout", "timed out",
+
+            "connection", "reset", "refused",
+
+            "temporarily", "unavailable",
+
+            "network", "ssl", "eof",
+
+        ]
+
+        return any(p in error_str for p in retryable_patterns)
+
+
+
+    def _retry_api_call(self, func, *args, **kwargs):
+
+        """
+
+        API 호출을 재시도 로직으로 감싸기
+
+        - 5xx 오류, 타임아웃, 연결 오류 시 자동 재시도
+
+        - 지수 백오프 적용
+
+        """
+
+        max_retries = CONFIG["API_MAX_RETRIES"]
+
+        base_delay = CONFIG["API_RETRY_DELAY_BASE"]
+
+        max_delay = CONFIG["API_RETRY_DELAY_MAX"]
+
+        
+
+        last_exception = None
+
+        
+
+        for attempt in range(max_retries + 1):
+
+            try:
+
+                result = func(*args, **kwargs)
+
+                # 성공 시 연속 오류 카운터 리셋
+
+                self._consecutive_errors = 0
+
+                return result
+
+                
+
+            except Exception as e:
+
+                last_exception = e
+
+                error_str = str(e)
+
+                
+
+                # 재시도 가능한 오류인지 체크
+
+                if not self._is_retryable_error(e):
+
+                    tg_log(f"❌ API error (non-retryable): {error_str[:100]}")
+
+                    raise
+
+                
+
+                # 504 Gateway Timeout은 일시적 문제 - 간결한 로그
+
+                is_504 = "504" in error_str or "gateway" in error_str.lower()
+
+                
+
+                # 마지막 시도였으면 예외 발생
+
+                if attempt >= max_retries:
+
+                    self._consecutive_errors += 1
+
+                    self._last_error_time = time.time()
+
+                    
+
+                    # 504 에러는 warning 레벨 (서버 일시 문제)
+
+                    if is_504:
+
+                        tg_log(f"⚠️ API timeout after {max_retries+1} attempts (Opinion Trade server busy)")
+
+                    else:
+
+                        tg_log(f"❌ API failed after {max_retries+1} attempts: {error_str[:100]}")
+
+                    
+
+                    # 연속 오류가 임계값 초과하면 클라이언트 재초기화
+
+                    if self._consecutive_errors >= CONFIG["CONSECUTIVE_ERROR_LIMIT"]:
+
+                        tg_log(f"🔄 Reinitializing client after {self._consecutive_errors} consecutive errors...")
+
+                        try:
+
+                            self._init_client()
+
+                            self._consecutive_errors = 0
+
+                            tg_log("✅ Client reinitialized")
+
+                        except Exception as reinit_err:
+
+                            tg_log(f"❌ Client reinit failed: {reinit_err}")
+
+                    raise
+
+                
+
+                # 재시도 대기 (지수 백오프 + 지터)
+
+                delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+
+                
+
+                # 504 에러는 첫 시도에서만 로그 (스팸 방지)
+
+                if is_504:
+
+                    if attempt == 0:
+
+                        tg_log(f"⏳ API timeout (attempt 1/{max_retries+1}), retrying...")
+
+                else:
+
+                    tg_log(f"⚠️ API error (attempt {attempt+1}/{max_retries+1}): {error_str[:60]}... retrying in {delay:.1f}s")
+
+                
+
+                time.sleep(delay)
+
+        
+
+        # 여기 도달하면 안 되지만 안전장치
+
+        if last_exception:
+
+            raise last_exception
+
+
+
+    def _unwrap(self, resp: Any) -> Tuple[int, Any, str]:
+
+        if resp is None:
+
+            return 999, None, "None response"
+
+        if hasattr(resp, "errno"):
+
+            errno = getattr(resp, "errno", 999) or 0
+
+            errmsg = getattr(resp, "errmsg", "") or ""
+
+            result = getattr(resp, "result", None)
+
+            return int(errno), result, str(errmsg)
+
+        if isinstance(resp, dict):
+
+            errno = resp.get("errno", 0) or 0
+
+            errmsg = resp.get("errmsg", "") or ""
+
+            result = resp.get("result", None)
+
+            return int(errno), result, str(errmsg)
+
+        rd = obj_to_dict(resp)
+
+        if isinstance(rd, dict):
+
+            errno = rd.get("errno", 0) or 0
+
+            errmsg = rd.get("errmsg", "") or ""
+
+            result = rd.get("result", None)
+
+            return int(errno), result, str(errmsg)
+
+        return 999, None, "Unrecognized response"
+
+
+
+    def _best_effort_load_fee_rates(self):
+
+        for fn in ["get_fee_rates", "get_fee_rate", "fee_rates"]:
+
+            if hasattr(self.client, fn):
+
+                try:
+
+                    resp = getattr(self.client, fn)()
+
+                    errno, result, _ = self._unwrap(resp)
+
+                    if errno != 0:
+
+                        continue
+
+                    rd = obj_to_dict(result)
+
+                    if isinstance(rd, dict):
+
+                        mf = safe_decimal(rd.get("makerFeeRate") or rd.get("maker_fee_rate") or rd.get("maker"))
+
+                        tf = safe_decimal(rd.get("takerFeeRate") or rd.get("taker_fee_rate") or rd.get("taker"))
+
+                        if mf is not None:
+
+                            self.maker_fee_rate = mf
+
+                        if tf is not None:
+
+                            self.taker_fee_rate = tf
+
+                except:
+
+                    pass
+
+
+
+    def get_market(self, market_id: int) -> Optional[MarketInfo]:
+
+        """마켓 상세 조회 (binary + multi-outcome 지원)"""
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.get_market, market_id=market_id, use_cache=False
+
+            )
+
+        except Exception as e:
+
+            tg_log(f"❌ get_market failed: {e}")
+
+            return None
+
+        
+
+        errno, result, _ = self._unwrap(resp)
+
+        if errno != 0:
+
+            return None
+
+        data = getattr(result, "data", result)
+
+        d = obj_to_dict(data)
+
+        if not isinstance(d, dict):
+
+            return None
+
+        
+
+        # 하위 마켓 (outcomes) 파싱 - 가능한 모든 필드 체크
+
+        sub_markets: List[SubMarketInfo] = []
+
+        
+
+        # API 응답에서 outcomes를 찾기 위한 모든 가능한 필드명 시도
+
+        outcomes = (
+
+            d.get("child_markets") or       # ⭐ snake_case 우선!
+
+            d.get("childMarkets") or        # camelCase
+
+            d.get("outcomes") or 
+
+            d.get("marketOptions") or 
+
+            d.get("market_options") or
+
+            d.get("options") or 
+
+            d.get("sub_markets") or
+
+            d.get("subMarkets") or
+
+            d.get("children") or
+
+            []
+
+        )
+
+        
+
+        if outcomes and isinstance(outcomes, list):
+
+            for idx, o in enumerate(outcomes):
+
+                od = obj_to_dict(o)
+
+                if not isinstance(od, dict):
+
+                    continue
+
+                
+
+                # outcome 정보 추출 (다양한 필드명 지원)
+
+                outcome_id = int(od.get("outcome_id") or od.get("outcomeId") or od.get("id") or od.get("optionId") or idx)
+
+                name = str(od.get("name") or od.get("outcome_name") or od.get("outcomeName") or od.get("title") or od.get("optionName") or f"Option {idx}")
+
+                
+
+                # 토큰 ID 추출 (YES 토큰)
+
+                token_id = str(
+
+                    od.get("token_id") or 
+
+                    od.get("tokenId") or 
+
+                    od.get("yes_token_id") or 
+
+                    od.get("yesTokenId") or 
+
+                    od.get("outcomeTokenId") or
+
+                    ""
+
+                )
+
+                
+
+                # NO 토큰 ID
+
+                no_token_id = str(
+
+                    od.get("no_token_id") or 
+
+                    od.get("noTokenId") or 
+
+                    ""
+
+                )
+
+                
+
+                # 볼륨과 확률
+
+                vol = Decimal(str(od.get("volume") or od.get("totalVolume") or 0))
+
+                chance = Decimal(str(od.get("chance") or od.get("probability") or od.get("price") or 0))
+
+                
+
+                sub_markets.append(SubMarketInfo(
+
+                    outcome_id=outcome_id,
+
+                    name=name,
+
+                    token_id=token_id,
+
+                    no_token_id=no_token_id,
+
+                    volume=vol,
+
+                    chance=chance,
+
+                ))
+
+        
+
+        # 볼륨 계산: 하위 마켓이 있으면 합산, 없으면 상위 마켓 볼륨 사용
+
+        if sub_markets:
+
+            # 하위 마켓들의 볼륨 합산
+
+            total_volume = sum(sub.volume for sub in sub_markets)
+
+            # 만약 합산 볼륨이 0이면 상위 마켓 볼륨 사용
+
+            if total_volume == 0:
+
+                total_volume = Decimal(str(d.get("volume") or d.get("total_volume") or d.get("totalVolume") or 0))
+
+        else:
+
+            # binary 마켓: 상위 마켓 볼륨 사용
+
+            total_volume = Decimal(str(d.get("volume") or d.get("total_volume") or d.get("totalVolume") or 0))
+
+        
+
+        # YES/NO 토큰 (binary 마켓용)
+
+        yes_tid = str(d.get("yes_token_id") or d.get("yesTokenId") or "")
+
+        no_tid = str(d.get("no_token_id") or d.get("noTokenId") or "")
+
+        
+
+        # multi-outcome 마켓인데 yes_token_id가 없으면, 첫 번째 하위 마켓의 토큰 사용
+
+        if not yes_tid and sub_markets:
+
+            yes_tid = sub_markets[0].token_id
+
+            no_tid = sub_markets[0].no_token_id
+
+        
+
+        # 타이틀 추출
+
+        title = str(
+
+            d.get("market_title") or 
+
+            d.get("marketTitle") or 
+
+            d.get("title") or 
+
+            d.get("topic_title") or
+
+            d.get("topicTitle") or
+
+            ""
+
+        )
+
+        
+
+        return MarketInfo(
+
+            market_id=int(d.get("market_id") or d.get("marketId") or d.get("topicId") or d.get("topic_id") or market_id),
+
+            title=title,
+
+            yes_token_id=yes_tid,
+
+            no_token_id=no_tid,
+
+            status=int(d.get("status") or d.get("topicStatus") or 0),
+
+            volume=total_volume,
+
+            sub_markets=sub_markets,
+
+        )
+
+
+
+    def get_markets(self, page: int = 1, limit: int = 20) -> List[MarketInfo]:
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.get_markets, status=TopicStatusFilter.ACTIVATED, page=page, limit=limit
+
+            )
+
+        except Exception as e:
+
+            tg_log(f"❌ get_markets failed: {e}")
+
+            return []
+
+        
+
+        errno, result, _ = self._unwrap(resp)
+
+        if errno != 0:
+
+            return []
+
+        lst = getattr(result, "list", None)
+
+        if lst is None:
+
+            rd = obj_to_dict(result)
+
+            if isinstance(rd, dict):
+
+                lst = rd.get("list") or rd.get("data") or []
+
+        if not lst:
+
+            return []
+
+        out: List[MarketInfo] = []
+
+        for it in lst:
+
+            d = obj_to_dict(it)
+
+            if not isinstance(d, dict):
+
+                continue
+
+            
+
+            # child_markets 파싱
+
+            sub_markets: List[SubMarketInfo] = []
+
+            child_markets = d.get("child_markets") or d.get("childMarkets") or []
+
+            
+
+            if child_markets and isinstance(child_markets, list):
+
+                for idx, child in enumerate(child_markets):
+
+                    cd = obj_to_dict(child) if not isinstance(child, dict) else child
+
+                    if isinstance(cd, dict):
+
+                        sub_markets.append(SubMarketInfo(
+
+                            outcome_id=int(cd.get("market_id") or cd.get("marketId") or idx),
+
+                            name=str(cd.get("market_title") or cd.get("marketTitle") or cd.get("title") or f"Option {idx}"),
+
+                            token_id=str(cd.get("yes_token_id") or cd.get("yesTokenId") or ""),
+
+                            no_token_id=str(cd.get("no_token_id") or cd.get("noTokenId") or ""),
+
+                            volume=Decimal(str(cd.get("volume") or 0)),
+
+                            chance=Decimal(str(cd.get("chance") or cd.get("probability") or 0)),
+
+                        ))
+
+            
+
+            # 볼륨: child markets가 있으면 합산
+
+            if sub_markets:
+
+                volume = sum(sub.volume for sub in sub_markets)
+
+            else:
+
+                volume = Decimal(str(d.get("volume") or d.get("total_volume") or 0))
+
+            
+
+            yes_tid = d.get("yes_token_id") or d.get("yesTokenId") or ""
+
+            no_tid = d.get("no_token_id") or d.get("noTokenId") or ""
+
+            
+
+            out.append(MarketInfo(
+
+                market_id=int(d.get("market_id") or d.get("marketId") or 0),
+
+                title=str(d.get("market_title") or d.get("marketTitle") or ""),
+
+                yes_token_id=str(yes_tid),
+
+                no_token_id=str(no_tid),
+
+                status=int(d.get("status") or 0),
+
+                volume=volume,
+
+                sub_markets=sub_markets,  # ⭐ child_markets 추가!
+
+            ))
+
+        return out
+
+
+
+    def get_orderbook(self, token_id: str) -> Dict[str, List[Dict[str, Decimal]]]:
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.get_orderbook, token_id=token_id
+
+            )
+
+        except Exception as e:
+
+            # 오더북 조회 실패는 조용히 처리 (빈 오더북 반환)
+
+            return {"bids": [], "asks": []}
+
+        
+
+        errno, result, _ = self._unwrap(resp)
+
+        if errno != 0:
+
+            return {"bids": [], "asks": []}
+
+
+
+        bids: List[Dict[str, Decimal]] = []
+
+        asks: List[Dict[str, Decimal]] = []
+
+
+
+        if hasattr(result, "bids") or hasattr(result, "asks"):
+
+            if getattr(result, "bids", None):
+
+                for b in result.bids:
+
+                    bd = obj_to_dict(b) if not isinstance(b, dict) else b
+
+                    p = safe_decimal(bd.get("price") if isinstance(bd, dict) else getattr(b, "price", None))
+
+                    s = safe_decimal(bd.get("size") if isinstance(bd, dict) else getattr(b, "size", None)) or Decimal("0")
+
+                    if p is not None:
+
+                        bids.append({"price": p, "size": s})
+
+            if getattr(result, "asks", None):
+
+                for a in result.asks:
+
+                    ad = obj_to_dict(a) if not isinstance(a, dict) else a
+
+                    p = safe_decimal(ad.get("price") if isinstance(ad, dict) else getattr(a, "price", None))
+
+                    s = safe_decimal(ad.get("size") if isinstance(ad, dict) else getattr(a, "size", None)) or Decimal("0")
+
+                    if p is not None:
+
+                        asks.append({"price": p, "size": s})
+
+        else:
+
+            rd = obj_to_dict(result)
+
+            if isinstance(rd, dict):
+
+                for b in (rd.get("bids") or []):
+
+                    if isinstance(b, dict):
+
+                        p = safe_decimal(b.get("price"))
+
+                        s = safe_decimal(b.get("size")) or Decimal("0")
+
+                        if p is not None:
+
+                            bids.append({"price": p, "size": s})
+
+                for a in (rd.get("asks") or []):
+
+                    if isinstance(a, dict):
+
+                        p = safe_decimal(a.get("price"))
+
+                        s = safe_decimal(a.get("size")) or Decimal("0")
+
+                        if p is not None:
+
+                            asks.append({"price": p, "size": s})
+
+
+
+        return {"bids": bids, "asks": asks}
+
+
+
+    def get_best_prices(self, token_id: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+
+        book = self.get_orderbook(token_id)
+
+        best_bid = max((x["price"] for x in book["bids"]), default=None)
+
+        best_ask = min((x["price"] for x in book["asks"]), default=None)
+
+        return best_bid, best_ask
+
+
+
+    def place_limit_order(self, market_id: int, token_id: str, is_buy: bool,
+
+                          price: Decimal, amount: Decimal, is_quote_token: bool) -> Optional[str]:
+
+        price = q_price(price)
+
+        side_enum = OrderSide.BUY if is_buy else OrderSide.SELL
+
+        order = PlaceOrderDataInput(
+
+            marketId=market_id,
+
+            tokenId=token_id,
+
+            side=side_enum,
+
+            orderType=LIMIT_ORDER,
+
+            price=str(price),
+
+        )
+
+        if is_quote_token:
+
+            order.makerAmountInQuoteToken = float(amount)
+
+        else:
+
+            order.makerAmountInBaseToken = float(amount)
+
+
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.place_order, order, check_approval=True
+
+            )
+
+        except Exception as e:
+
+            tg_log(f"❌ place_order exception: {str(e)[:100]}")
+
+            return None
+
+        
+
+        errno, result, errmsg = self._unwrap(resp)
+
+        if errno != 0:
+
+            tg_log(f"❌ place_order failed: {errmsg}")
+
+            return None
+
+
+
+        rd = obj_to_dict(result)
+
+        order_id = None
+
+        if isinstance(rd, dict):
+
+            od = rd.get("order_data") or rd.get("orderData") or {}
+
+            if isinstance(od, dict):
+
+                order_id = od.get("order_id") or od.get("orderId")
+
+            order_id = order_id or rd.get("order_id") or rd.get("orderId")
+
+        return str(order_id) if order_id else None
+
+
+
+    def cancel_order(self, order_id: str) -> bool:
+
+        try:
+
+            # SDK는 positional argument만 받음
+
+            resp = self._retry_api_call(
+
+                self.client.cancel_order, order_id  # kwargs 없이 직접 전달
+
+            )
+
+            errno, _, _ = self._unwrap(resp)
+
+            if errno == 0:
+
+                return True
+
+        except Exception as e:
+
+            tg_log(f"⚠️ Cancel order failed: {e}")
+
+        return False
+
+
+
+    def cancel_all_orders(self, market_id: int) -> bool:
+
+        if not hasattr(self.client, "cancel_all_orders"):
+
+            return False
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.cancel_all_orders, market_id=market_id
+
+            )
+
+            errno, _, _ = self._unwrap(resp)
+
+            return errno == 0
+
+        except Exception as e:
+
+            return False
+
+
+
+    def get_my_orders(self, market_id: int, limit: int = 200, status: Optional[str] = None) -> List[Dict[str, Any]]:
+
+        try:
+
+            kwargs = {"market_id": market_id, "limit": limit}
+
+            if status is not None:
+
+                kwargs["status"] = status
+
+            resp = self._retry_api_call(
+
+                self.client.get_my_orders, **kwargs
+
+            )
+
+            errno, result, _ = self._unwrap(resp)
+
+            if errno != 0:
+
+                return []
+
+            rd = obj_to_dict(result)
+
+            if isinstance(rd, dict):
+
+                data = rd.get("data") or rd.get("list") or []
+
+                if isinstance(data, list):
+
+                    return [obj_to_dict(x) if not isinstance(x, dict) else x for x in data]
+
+            if isinstance(rd, list):
+
+                return [obj_to_dict(x) if not isinstance(x, dict) else x for x in rd]
+
+            return []
+
+        except Exception as e:
+
+            return []
+
+
+
+    def get_order_by_id(self, order_id: str) -> Optional[Dict[str, Any]]:
+
+        if not hasattr(self.client, "get_order_by_id"):
+
+            return None
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.get_order_by_id, order_id  # positional
+
+            )
+
+            errno, result, _ = self._unwrap(resp)
+
+            if errno != 0:
+
+                return None
+
+            d = obj_to_dict(getattr(result, "data", result))
+
+            return d if isinstance(d, dict) else None
+
+        except Exception as e:
+
+            return None
+
+
+
+    def get_my_trades(self, market_id: int, limit: int = 200) -> List[Any]:
+
+        if not hasattr(self.client, "get_my_trades"):
+
+            return []
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.get_my_trades, market_id=market_id, limit=limit
+
+            )
+
+            errno, result, _ = self._unwrap(resp)
+
+            if errno != 0:
+
+                return []
+
+            rd = obj_to_dict(result)
+
+            if isinstance(rd, dict):
+
+                data = rd.get("data") or rd.get("list") or []
+
+                if isinstance(data, list):
+
+                    return data
+
+            if isinstance(rd, list):
+
+                return rd
+
+            return []
+
+        except Exception as e:
+
+            return []
+
+
+
+    def get_my_positions(self, limit: int = 100) -> List[Dict[str, Any]]:
+
+        """
+
+        실제 API로 현재 position 조회
+
+        Returns: List of positions with token_id, amount, market info
+
+        """
+
+        if not hasattr(self.client, "get_my_positions"):
+
+            return []
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.get_my_positions, limit=limit
+
+            )
+
+            errno, result, _ = self._unwrap(resp)
+
+            if errno != 0:
+
+                return []
+
+            rd = obj_to_dict(result)
+
+            if isinstance(rd, dict):
+
+                data = rd.get("data") or rd.get("list") or []
+
+                if isinstance(data, list):
+
+                    return data
+
+            if isinstance(rd, list):
+
+                return rd
+
+            return []
+
+        except Exception as e:
+
+            return []
+
+
+
+    def get_my_balances(self) -> Dict[str, Any]:
+
+        """
+
+        실제 API로 현재 balance 조회
+
+        Returns: Dict with token balances
+
+        """
+
+        if not hasattr(self.client, "get_my_balances"):
+
+            return {}
+
+        try:
+
+            resp = self._retry_api_call(
+
+                self.client.get_my_balances
+
+            )
+
+            errno, result, _ = self._unwrap(resp)
+
+            if errno != 0:
+
+                return {}
+
+            rd = obj_to_dict(result)
+
+            if isinstance(rd, dict):
+
+                return rd
+
+            return {}
+
+        except Exception as e:
+
+            return {}
+
+
+
+# ============================================================
+
+# trades parsing
+
+# ============================================================
+
+@dataclass
+
+class ParsedTrade:
+
+    uid: str
+
+    order_id: Optional[str]
+
+    token_id: Optional[str]
+
+    is_buy: Optional[bool]
+
+    price: Decimal
+
+    base: Decimal
+
+    quote: Decimal
+
+    fee_quote: Decimal
+
+
+
+def _trade_uid(d: Dict[str, Any]) -> str:
+
+    a = str(d.get("trade_id") or d.get("tradeId") or d.get("id") or "")
+
+    b = str(d.get("txHash") or d.get("transactionHash") or d.get("hash") or "")
+
+    c = str(d.get("logIndex") or d.get("index") or "")
+
+    t = str(d.get("timestamp") or d.get("createdAt") or d.get("time") or "")
+
+    key = "|".join([x for x in [a, b, c, t] if x])
+
+    return key if key else str(hash(json.dumps(d, sort_keys=True)))
+
+
+
+def parse_trade(tr: Any, maker_fee: Decimal, taker_fee: Decimal) -> Optional[ParsedTrade]:
+
+    d = obj_to_dict(tr)
+
+    if not isinstance(d, dict):
+
+        return None
+
+
+
+    uid = _trade_uid(d)
+
+    order_id = d.get("order_id") or d.get("orderId") or d.get("orderID")
+
+    token_id = d.get("token_id") or d.get("tokenId")
+
+
+
+    side_raw = str(d.get("side") or d.get("orderSide") or d.get("direction") or "").lower()
+
+    is_buy = None
+
+    if "buy" in side_raw:
+
+        is_buy = True
+
+    elif "sell" in side_raw:
+
+        is_buy = False
+
+
+
+    price = safe_decimal(d.get("price") or d.get("tradePrice") or d.get("fillPrice") or d.get("rate"))
+
+    if price is None or price <= 0:
+
+        return None
+
+
+
+    base = safe_decimal(
+
+        d.get("amountInBaseToken") or d.get("baseAmount") or d.get("makerAmountInBaseToken")
+
+        or d.get("filledBase") or d.get("quantity") or d.get("size")
+
+    )
+
+    quote = safe_decimal(
+
+        d.get("amountInQuoteToken") or d.get("quoteAmount") or d.get("makerAmountInQuoteToken")
+
+        or d.get("filledQuote") or d.get("notional")
+
+    )
+
+
+
+    if base is None and quote is not None:
+
+        base = quote / price
+
+    if quote is None and base is not None:
+
+        quote = base * price
+
+    if base is None or quote is None:
+
+        return None
+
+
+
+    fee = safe_decimal(d.get("fee") or d.get("feeQuote") or d.get("feeAmount") or d.get("fee_amount"))
+
+    if fee is None:
+
+        role = str(d.get("liquidityRole") or d.get("role") or "").lower()
+
+        is_taker = ("taker" in role) or bool(d.get("isTaker") or d.get("taker"))
+
+        if ("maker" in role) or bool(d.get("isMaker") or d.get("maker")):
+
+            is_taker = False
+
+        fee_rate = taker_fee if is_taker else maker_fee
+
+        fee = quote * fee_rate
+
+
+
+    fee = max(Decimal("0"), fee)
+
+    base = max(Decimal("0"), base)
+
+    quote = max(Decimal("0"), quote)
+
+    return ParsedTrade(
+
+        uid=uid,
+
+        order_id=str(order_id) if order_id else None,
+
+        token_id=str(token_id) if token_id else None,
+
+        is_buy=is_buy,
+
+        price=price,
+
+        base=base,
+
+        quote=quote,
+
+        fee_quote=fee,
+
+    )
+
+
+
+# ============================================================
+
+# manager
+
+# ============================================================
+
+class StrategyManager:
+
+    def __init__(self):
+
+        self.client: Optional[OpinionClient] = None
+
+        self._lock = threading.RLock()
+
+        self._loop_thread: Optional[threading.Thread] = None
+
+        self._stop_flag = False
+
+        self._last_save_ts = 0.0
+
+
+
+        self.sessions: Dict[int, SessionState] = {}
+
+        self._seen_sets: Dict[int, set] = {}
+
+        self._seen_deques: Dict[int, deque] = {}
+
+
+
+        self._last_guard_log: Dict[str, float] = {}
+
+
+
+    def initialize(self) -> bool:
+
+        try:
+
+            self.client = OpinionClient()
+
+            return True
+
+        except Exception as e:
+
+            print(f"❌ Init failed: {e}")
+
+            return False
+
+
+
+    # persistence
+
+    def save_state(self, force: bool = False):
+
+        now = time.time()
+
+        if not force and (now - self._last_save_ts) < CONFIG["STATE_SAVE_MIN_INTERVAL_SEC"]:
+
+            return
+
+        with self._lock:
+
+            data = {
+
+                "version": "4.2",
+
+                "saved_at": now,
+
+                "sessions": [asdict(s) for s in self.sessions.values()],
+
+            }
+
+        try:
+
+            atomic_write_json(CONFIG["STATE_FILE"], data)
+
+            self._last_save_ts = now
+
+        except Exception as e:
+
+            # avoid log spam on persistent FS/permission errors
+
+            key = "state_save_failed"
+
+            last = self._last_guard_log.get(key, 0.0)
+
+            if (now - last) > 30:  # 30초에 한 번만 로그
+
+                tg_log(f"⚠️ state save failed: {e}")
+
+                self._last_guard_log[key] = now
+
+
+
+    def restore_state(self):
+
+        path = CONFIG["STATE_FILE"]
+
+        if not os.path.exists(path):
+
+            return
+
+        try:
+
+            with open(path, "r", encoding="utf-8") as f:
+
+                data = json.load(f)
+
+        except Exception as e:
+
+            tg_log(f"⚠️ state load failed: {e}")
+
+            return
+
+
+
+        sess_list = data.get("sessions") or []
+
+        restored = 0
+
+        with self._lock:
+
+            self.sessions.clear()
+
+            self._seen_sets.clear()
+
+            self._seen_deques.clear()
+
+
+
+            for sd in sess_list:
+
+                try:
+
+                    m = sd["market"]
+
+                    market = MarketInfo(
+
+                        market_id=int(m["market_id"]),
+
+                        title=str(m["title"]),
+
+                        yes_token_id=str(m["yes_token_id"]),
+
+                        no_token_id=str(m["no_token_id"]),
+
+                        status=int(m["status"]),
+
+                    )
+
+                    
+
+                    stats_data = sd.get("stats") or {}
+
+                    stats = Stats(
+
+                        total_volume=str(stats_data.get("total_volume", "0")),
+
+                        total_trades=int(stats_data.get("total_trades", 0)),
+
+                        buy_cost=str(stats_data.get("buy_cost", "0")),
+
+                        sell_proceeds=str(stats_data.get("sell_proceeds", "0")),
+
+                        total_fees=str(stats_data.get("total_fees", "0")),
+
+                        realized_pnl=str(stats_data.get("realized_pnl", "0")),
+
+                    )
+
+                    
+
+                    s = SessionState(
+
+                        market=market,
+
+                        total_budget=str(sd.get("total_budget", "0")),
+
+                        yes_budget=str(sd.get("yes_budget", "0")),
+
+                        no_budget=str(sd.get("no_budget", "0")),
+
+                        yes_position=str(sd.get("yes_position", "0")),
+
+                        no_position=str(sd.get("no_position", "0")),
+
+                        yes_buy_order=OrderInfo(**sd["yes_buy_order"]) if sd.get("yes_buy_order") else None,
+
+                        no_buy_order=OrderInfo(**sd["no_buy_order"]) if sd.get("no_buy_order") else None,
+
+                        yes_sell_order=OrderInfo(**sd["yes_sell_order"]) if sd.get("yes_sell_order") else None,
+
+                        no_sell_order=OrderInfo(**sd["no_sell_order"]) if sd.get("no_sell_order") else None,
+
+                        stats=stats,
+
+                        state=str(sd.get("state", BotState.RUNNING.value)),
+
+                        seen_trade_uids=sd.get("seen_trade_uids") or [],
+
+                        # 손실 보호 필드 복원
+
+                        yes_avg_buy_price=str(sd.get("yes_avg_buy_price", "0")),
+
+                        no_avg_buy_price=str(sd.get("no_avg_buy_price", "0")),
+
+                        yes_total_buy_cost=str(sd.get("yes_total_buy_cost", "0")),
+
+                        no_total_buy_cost=str(sd.get("no_total_buy_cost", "0")),
+
+                        yes_side_paused=bool(sd.get("yes_side_paused", False)),
+
+                        no_side_paused=bool(sd.get("no_side_paused", False)),
+
+                        yes_last_best_ask=str(sd.get("yes_last_best_ask", "0")),
+
+                        no_last_best_ask=str(sd.get("no_last_best_ask", "0")),
+
+                        protection_triggered_count=int(sd.get("protection_triggered_count", 0)),
+
+                    )
+
+                    self.sessions[market.market_id] = s
+
+
+
+                    dq = deque(s.seen_trade_uids[-CONFIG["TRADE_DEDUPE_MAX"]:], maxlen=CONFIG["TRADE_DEDUPE_MAX"])
+
+                    st = set(dq)
+
+                    self._seen_deques[market.market_id] = dq
+
+                    self._seen_sets[market.market_id] = st
+
+
+
+                    restored += 1
+
+                except Exception as e:
+
+                    tg_log(f"⚠️ restore session failed: {e}")
+
+                    continue
+
+
+
+        if restored:
+
+            tg_log(f"♻️ Restored {restored} session(s) from state")
+
+            self.reconcile_all_sessions()
+
+            self.save_state(force=True)
+
+
+
+    def reconcile_all_sessions(self):
+
+        with self._lock:
+
+            mids = list(self.sessions.keys())
+
+        for mid in mids:
+
+            try:
+
+                self.sync_trades(mid)
+
+                self.reconcile_orders(mid)
+
+            except Exception as e:
+
+                tg_log(f"⚠️ reconcile failed (market {mid}): {e}")
+
+
+
+    # loop
+
+    def start_loop(self):
+
+        if self._loop_thread and self._loop_thread.is_alive():
+
+            return
+
+        self._stop_flag = False
+
+        self._loop_thread = threading.Thread(target=self._main_loop, daemon=True)
+
+        self._loop_thread.start()
+
+
+
+    def stop_loop(self):
+
+        self._stop_flag = True
+
+        if self._loop_thread:
+
+            self._loop_thread.join(timeout=10)
+
+
+
+    def _main_loop(self):
+
+        tg_log("🔄 Manager loop started")
+
+        consecutive_loop_errors = 0
+
+        
+
+        while not self._stop_flag:
+
+            try:
+
+                with self._lock:
+
+                    mids = list(self.sessions.keys())
+
+
+
+                for mid in mids:
+
+                    if self._stop_flag:
+
+                        break
+
+                        
+
+                    s = self.sessions.get(mid)
+
+                    if not s:
+
+                        continue
+
+                    if s.state == BotState.PAUSED.value:
+
+                        continue
+
+                    if s.state != BotState.RUNNING.value:
+
+                        continue
+
+
+
+                    # 세션 손실 한도 체크
+
+                    if self._check_session_loss_limit(s):
+
+                        continue  # 한도 초과로 중단됨
+
+
+
+                    try:
+
+                        self.sync_trades(mid)
+
+                        self.manage_market(mid)
+
+                    except Exception as market_err:
+
+                        tg_log(f"⚠️ Market {mid} error: {str(market_err)[:80]}")
+
+                        # 개별 마켓 오류는 다음 마켓으로 계속
+
+
+
+                self.save_state()
+
+                consecutive_loop_errors = 0  # 성공 시 리셋
+
+                time.sleep(CONFIG["CHECK_INTERVAL"])
+
+                
+
+            except Exception as e:
+
+                consecutive_loop_errors += 1
+
+                tg_log(f"❌ Manager loop error ({consecutive_loop_errors}): {str(e)[:100]}")
+
+                
+
+                # 연속 오류가 많으면 대기 시간 증가
+
+                if consecutive_loop_errors >= 10:
+
+                    tg_log("⚠️ Too many consecutive errors, waiting 60s...")
+
+                    time.sleep(60)
+
+                elif consecutive_loop_errors >= 5:
+
+                    time.sleep(15)
+
+                else:
+
+                    time.sleep(5)
+
+
+
+    # ============================================================
+
+    # 🛡️ 손실 보호 로직
+
+    # ============================================================
+
+    def _check_session_loss_limit(self, s: SessionState) -> bool:
+
+        """세션 전체 손실 한도 체크. 한도 초과 시 True 반환."""
+
+        total_budget = Decimal(s.total_budget)
+
+        if total_budget <= 0:
+
+            return False
+
+        
+
+        pnl = s.stats.realized_pnl_d()
+
+        loss_rate = -pnl / total_budget if pnl < 0 else Decimal("0")
+
+        
+
+        if loss_rate >= Decimal(str(CONFIG["MAX_SESSION_LOSS_RATE"])):
+
+            tg_log(f"🚨 SESSION LOSS LIMIT m#{s.market.market_id}: "
+
+                   f"PnL ${pnl:.4f} = {float(loss_rate)*100:.1f}% loss >= {CONFIG['MAX_SESSION_LOSS_RATE']*100:.0f}% limit")
+
+            tg_log(f"🛑 Auto-stopping session m#{s.market.market_id}")
+
+            self.stop_strategy(s.market.market_id)
+
+            return True
+
+        return False
+
+
+
+    def _check_sell_protection(self, s: SessionState, side_name: str, 
+
+                                best_ask: Optional[Decimal]) -> bool:
+
+        """
+
+        매도 전 보호 체크. 
+
+        매수가 대비 손실이 MAX_LOSS_TICKS 초과하면 True (매도 거부).
+
+        """
+
+        if best_ask is None:
+
+            return False
+
+        
+
+        # 평균 매수가 가져오기
+
+        if side_name == "YES":
+
+            avg_buy = Decimal(s.yes_avg_buy_price)
+
+            position = Decimal(s.yes_position)
+
+        else:
+
+            avg_buy = Decimal(s.no_avg_buy_price)
+
+            position = Decimal(s.no_position)
+
+        
+
+        # 포지션이 없거나 평균 매수가가 0이면 체크 불필요
+
+        if position <= 0 or avg_buy <= 0:
+
+            return False
+
+        
+
+        # 최소 허용 매도가 계산
+
+        tick = CONFIG["PRICE_QUANT"]
+
+        max_loss_ticks = CONFIG["MAX_LOSS_TICKS"]
+
+        min_sell_price = avg_buy - (tick * max_loss_ticks)
+
+        
+
+        # best_ask가 최소 허용 매도가보다 낮으면 보호 발동
+
+        if best_ask < min_sell_price:
+
+            loss_ticks = int((avg_buy - best_ask) / tick)
+
+            loss_pct = float((avg_buy - best_ask) / avg_buy) * 100
+
+            
+
+            tg_log(f"🛡️ SELL PROTECTION TRIGGERED m#{s.market.market_id} {side_name}")
+
+            tg_log(f"   avg_buy: {avg_buy} | best_ask: {best_ask}")
+
+            tg_log(f"   loss: {loss_ticks} ticks ({loss_pct:.1f}%) > limit {max_loss_ticks} ticks")
+
+            
+
+            s.protection_triggered_count += 1
+
+            
+
+            # 해당 사이드 일시정지
+
+            if CONFIG["PROTECTION_ACTION"] == "pause":
+
+                if side_name == "YES":
+
+                    s.yes_side_paused = True
+
+                else:
+
+                    s.no_side_paused = True
+
+                tg_log(f"⏸️ {side_name} side paused (use /unpause {s.market.market_id} {side_name.lower()} to resume)")
+
+            elif CONFIG["PROTECTION_ACTION"] == "stop":
+
+                tg_log(f"🛑 Stopping session m#{s.market.market_id} due to protection")
+
+                self.stop_strategy(s.market.market_id)
+
+            
+
+            return True
+
+        
+
+        return False
+
+
+
+    def _check_price_drop_alert(self, s: SessionState, side_name: str,
+
+                                 best_ask: Optional[Decimal]):
+
+        """급락 감지 알림 (경고만, 동작 차단 안 함)"""
+
+        if best_ask is None:
+
+            return
+
+        
+
+        if side_name == "YES":
+
+            last_ask = Decimal(s.yes_last_best_ask)
+
+            s.yes_last_best_ask = str(best_ask)
+
+        else:
+
+            last_ask = Decimal(s.no_last_best_ask)
+
+            s.no_last_best_ask = str(best_ask)
+
+        
+
+        if last_ask <= 0:
+
+            return
+
+        
+
+        tick = CONFIG["PRICE_QUANT"]
+
+        drop_ticks = int((last_ask - best_ask) / tick)
+
+        
+
+        if drop_ticks >= CONFIG["PRICE_DROP_ALERT_TICKS"]:
+
+            tg_log(f"⚠️ PRICE DROP ALERT m#{s.market.market_id} {side_name}: "
+
+                   f"{last_ask} → {best_ask} ({drop_ticks} ticks drop)")
+
+
+
+    def _update_avg_buy_price(self, s: SessionState, side_name: str, 
+
+                               fill_price: Decimal, fill_base: Decimal):
+
+        """매수 체결 시 평균 매수가 업데이트 (가중평균)"""
+
+        if side_name == "YES":
+
+            old_pos = Decimal(s.yes_position)
+
+            old_cost = Decimal(s.yes_total_buy_cost)
+
+        else:
+
+            old_pos = Decimal(s.no_position)
+
+            old_cost = Decimal(s.no_total_buy_cost)
+
+        
+
+        new_cost = old_cost + (fill_price * fill_base)
+
+        new_pos = old_pos + fill_base
+
+        
+
+        if new_pos > 0:
+
+            new_avg = new_cost / new_pos
+
+        else:
+
+            new_avg = Decimal("0")
+
+        
+
+        if side_name == "YES":
+
+            s.yes_total_buy_cost = str(new_cost)
+
+            s.yes_avg_buy_price = str(new_avg)
+
+        else:
+
+            s.no_total_buy_cost = str(new_cost)
+
+            s.no_avg_buy_price = str(new_avg)
+
+
+
+    def _update_avg_sell(self, s: SessionState, side_name: str, 
+
+                          sell_base: Decimal):
+
+        """매도 체결 시 평균 매수가 비용 비례 차감"""
+
+        if side_name == "YES":
+
+            old_pos = Decimal(s.yes_position)
+
+            old_cost = Decimal(s.yes_total_buy_cost)
+
+        else:
+
+            old_pos = Decimal(s.no_position)
+
+            old_cost = Decimal(s.no_total_buy_cost)
+
+        
+
+        if old_pos > 0:
+
+            # 비례 차감
+
+            ratio = sell_base / old_pos
+
+            cost_reduction = old_cost * ratio
+
+            new_cost = max(Decimal("0"), old_cost - cost_reduction)
+
+        else:
+
+            new_cost = Decimal("0")
+
+        
+
+        new_pos = max(Decimal("0"), old_pos - sell_base)
+
+        
+
+        if new_pos > 0:
+
+            new_avg = new_cost / new_pos
+
+        else:
+
+            new_avg = Decimal("0")
+
+            new_cost = Decimal("0")
+
+        
+
+        if side_name == "YES":
+
+            s.yes_total_buy_cost = str(new_cost)
+
+            s.yes_avg_buy_price = str(new_avg)
+
+        else:
+
+            s.no_total_buy_cost = str(new_cost)
+
+            s.no_avg_buy_price = str(new_avg)
+
+
+
+    # ============================================================
+
+    # session ops
+
+    # ============================================================
+
+    def start_strategy(self, market_id: int, total_budget: Decimal) -> bool:
+
+        if not self.client:
+
+            return False
+
+
+
+        # 🎯 get_markets()로 마켓 찾기
+
+        target_market = None
+
+        all_markets = []
+
+        
+
+        try:
+
+            for page in range(1, 21):
+
+                markets = self.client.get_markets(page=page, limit=20)
+
+                if not markets:
+
+                    break
+
+                all_markets.extend(markets)
+
+                if len(markets) < 20:
+
+                    break
+
+            
+
+            # market_id가 parent인지 child인지 확인
+
+            for m in all_markets:
+
+                if m.market_id == market_id and not m.sub_markets:
+
+                    # Binary market (YES/NO)
+
+                    target_market = m
+
+                    break
+
+                elif m.sub_markets:
+
+                    # Child market 확인
+
+                    for sub in m.sub_markets:
+
+                        if sub.outcome_id == market_id:
+
+                            # Child를 독립 MarketInfo로 변환
+
+                            target_market = MarketInfo(
+
+                                market_id=sub.outcome_id,
+
+                                title=f"{m.title} - {sub.name}",
+
+                                yes_token_id=sub.token_id,
+
+                                no_token_id=sub.no_token_id,
+
+                                status=m.status,
+
+                                volume=sub.volume,
+
+                                sub_markets=[],
+
+                            )
+
+                            tg_log(f"✅ Found child market #{market_id} ({sub.name})")
+
+                            break
+
+                if target_market:
+
+                    break
+
+        except Exception as e:
+
+            tg_log(f"❌ Failed to fetch markets: {e}")
+
+            return False
+
+        
+
+        if not target_market:
+
+            tg_log(f"❌ Market {market_id} not found")
+
+            return False
+
+        
+
+        # Binary 마켓 체크 (YES/NO 토큰 필수)
+
+        if not target_market.yes_token_id or not target_market.no_token_id:
+
+            tg_log(f"❌ Market {market_id} has no YES/NO tokens")
+
+            tg_log(f"   Title: {target_market.title}")
+
+            if target_market.sub_markets:
+
+                tg_log(f"   This is a parent topic with {len(target_market.sub_markets)} outcomes")
+
+                tg_log("   Use /market <id> to see child markets")
+
+            return False
+
+
+
+        # 예산 배분 계산
+
+        yes_ratio, no_ratio = self._calculate_budget_ratio(target_market)
+
+        yes_budget = total_budget * yes_ratio
+
+        no_budget = total_budget * no_ratio
+
+
+
+        with self._lock:
+
+            if market_id in self.sessions and self.sessions[market_id].state == BotState.RUNNING.value:
+
+                tg_log("⚠️ already running")
+
+                return False
+
+
+
+            s = SessionState(
+
+                market=target_market,
+
+                total_budget=str(total_budget),
+
+                yes_budget=str(yes_budget),
+
+                no_budget=str(no_budget),
+
+                yes_position="0",
+
+                no_position="0",
+
+                stats=Stats(),
+
+                state=BotState.RUNNING.value,
+
+                seen_trade_uids=[],
+
+            )
+
+            self.sessions[market_id] = s
+
+            self._seen_deques[market_id] = deque(maxlen=CONFIG["TRADE_DEDUPE_MAX"])
+
+            self._seen_sets[market_id] = set()
+
+
+
+        tg_log("=" * 44)
+
+        tg_log(f"🚀 Started strategy market #{market_id}")
+
+        tg_log(f"📝 {target_market.title}")
+
+        tg_log(f"💰 Budget: ${total_budget}")
+
+        tg_log(f"   YES: ${yes_budget:.2f} ({float(yes_ratio)*100:.0f}%)")
+
+        tg_log(f"   NO:  ${no_budget:.2f} ({float(no_ratio)*100:.0f}%)")
+
+        tg_log(f"🛡️ Loss protection: {CONFIG['MAX_LOSS_TICKS']} ticks max")
+
+        tg_log("=" * 44)
+
+        self.save_state(force=True)
+
+        return True
+
+
+
+    def _calculate_budget_ratio(self, market: MarketInfo) -> Tuple[Decimal, Decimal]:
+
+        """
+
+        예산 배분 비율 계산
+
+        
+
+        동적 모드: 가격 비례 + 유동성 가중
+
+        - 고확률(고가) 쪽에 더 많이 배분 (1틱 변동에 덜 민감)
+
+        - 유동성 좋은 쪽에 약간 더 배분
+
+        - 30~70% 범위 제한
+
+        
+
+        손실 관점:
+
+        - YES 3¢에서 1틱 하락 → 3.3% 손실 (위험 높음)
+
+        - NO 97¢에서 1틱 하락 → 0.1% 손실 (위험 낮음)
+
+        → 고확률(NO) 쪽에 더 많이 배분하면 손실 위험 감소
+
+        """
+
+        if CONFIG["BUDGET_ALLOCATION_MODE"] == "fixed":
+
+            return Decimal("0.5"), Decimal("0.5")
+
+        
+
+        # 현재 가격 조회
+
+        yes_bid, yes_ask = self.client.get_best_prices(market.yes_token_id)
+
+        no_bid, no_ask = self.client.get_best_prices(market.no_token_id)
+
+        
+
+        # 가격 없으면 50:50
+
+        if not yes_bid or not no_bid:
+
+            tg_log("⚠️ Price not available, using 50:50")
+
+            return Decimal("0.5"), Decimal("0.5")
+
+        
+
+        yes_price = yes_bid
+
+        no_price = no_bid
+
+        
+
+        # 유동성 조회 (상위 5개 호가 총합)
+
+        yes_book = self.client.get_orderbook(market.yes_token_id)
+
+        no_book = self.client.get_orderbook(market.no_token_id)
+
+        
+
+        yes_depth = sum(b["size"] * b["price"] for b in yes_book["bids"][:5]) if yes_book["bids"] else Decimal("1")
+
+        no_depth = sum(b["size"] * b["price"] for b in no_book["bids"][:5]) if no_book["bids"] else Decimal("1")
+
+        
+
+        total_depth = yes_depth + no_depth
+
+        if total_depth <= 0:
+
+            total_depth = Decimal("1")
+
+        
+
+        # 가격 기반 위험 가중치 (고확률 = 고가에 더 많이)
+
+        # YES 3¢ → 가중치 0.03 (적게)
+
+        # NO 97¢ → 가중치 0.97 (많이)
+
+        yes_risk_weight = yes_price
+
+        no_risk_weight = no_price
+
+        
+
+        # 유동성 가중치
+
+        yes_depth_weight = yes_depth / total_depth
+
+        no_depth_weight = no_depth / total_depth
+
+        
+
+        # 혼합 (위험 70% + 유동성 30%)
+
+        yes_weight = Decimal("0.7") * yes_risk_weight + Decimal("0.3") * yes_depth_weight
+
+        no_weight = Decimal("0.7") * no_risk_weight + Decimal("0.3") * no_depth_weight
+
+        
+
+        total_weight = yes_weight + no_weight
+
+        if total_weight <= 0:
+
+            return Decimal("0.5"), Decimal("0.5")
+
+        
+
+        yes_ratio = yes_weight / total_weight
+
+        
+
+        # 30~70% 제한
+
+        min_ratio = CONFIG["DYNAMIC_RATIO_MIN"]
+
+        max_ratio = CONFIG["DYNAMIC_RATIO_MAX"]
+
+        yes_ratio = max(min_ratio, min(max_ratio, yes_ratio))
+
+        no_ratio = Decimal("1") - yes_ratio
+
+        
+
+        tg_log(f"📊 Budget allocation: YES {float(yes_price)*100:.1f}¢ / NO {float(no_price)*100:.1f}¢")
+
+        tg_log(f"   Depth: YES ${float(yes_depth):.0f} / NO ${float(no_depth):.0f}")
+
+        tg_log(f"   Ratio: YES {float(yes_ratio)*100:.0f}% / NO {float(no_ratio)*100:.0f}%")
+
+        
+
+        return yes_ratio, no_ratio
+
+
+
+    def stop_strategy(self, market_id: Optional[int] = None):
+
+        if market_id is None:
+
+            with self._lock:
+
+                mids = list(self.sessions.keys())
+
+            for mid in mids:
+
+                self.stop_strategy(mid)
+
+            return
+
+
+
+        with self._lock:
+
+            s = self.sessions.get(market_id)
+
+            if not s:
+
+                return
+
+            s.state = BotState.STOPPING.value
+
+
+
+        tg_log(f"🛑 Stopping market #{market_id} ...")
+
+        self.cancel_session_orders(market_id, refund=True)
+
+
+
+        with self._lock:
+
+            s = self.sessions.get(market_id)
+
+            if s:
+
+                s.state = BotState.IDLE.value
+
+        self.save_state(force=True)
+
+        tg_log(f"✅ Stopped market #{market_id}")
+
+
+
+    def pause_strategy(self, market_id: int):
+
+        with self._lock:
+
+            s = self.sessions.get(market_id)
+
+            if s and s.state == BotState.RUNNING.value:
+
+                s.state = BotState.PAUSED.value
+
+                self.save_state(force=True)
+
+        tg_log(f"⏸️ Paused market #{market_id}")
+
+
+
+    def resume_strategy(self, market_id: int):
+
+        with self._lock:
+
+            s = self.sessions.get(market_id)
+
+            if s and s.state == BotState.PAUSED.value:
+
+                s.state = BotState.RUNNING.value
+
+                self.save_state(force=True)
+
+        tg_log(f"▶️ Resumed market #{market_id}")
+
+
+
+    def unpause_side(self, market_id: int, side_name: str):
+
+        """보호로 일시정지된 사이드 해제"""
+
+        with self._lock:
+
+            s = self.sessions.get(market_id)
+
+            if not s:
+
+                tg_log(f"❌ Session not found: {market_id}")
+
+                return
+
+            
+
+            if side_name.upper() == "YES":
+
+                s.yes_side_paused = False
+
+                tg_log(f"▶️ YES side unpaused m#{market_id}")
+
+            elif side_name.upper() == "NO":
+
+                s.no_side_paused = False
+
+                tg_log(f"▶️ NO side unpaused m#{market_id}")
+
+            else:
+
+                tg_log(f"❌ Invalid side: {side_name}")
+
+                return
+
+            
+
+            self.save_state(force=True)
+
+
+
+    # trade dedupe
+
+    def _seen_has(self, market_id: int, uid: str) -> bool:
+
+        return uid in self._seen_sets.get(market_id, set())
+
+
+
+    def _seen_add(self, market_id: int, uid: str):
+
+        st = self._seen_sets.setdefault(market_id, set())
+
+        dq = self._seen_deques.setdefault(market_id, deque(maxlen=CONFIG["TRADE_DEDUPE_MAX"]))
+
+        if uid in st:
+
+            return
+
+        st.add(uid)
+
+        dq.append(uid)
+
+        s = self.sessions.get(market_id)
+
+        if s:
+
+            s.seen_trade_uids = list(dq)
+
+
+
+    def sync_trades(self, market_id: int):
+
+        if not self.client:
+
+            return
+
+        s = self.sessions.get(market_id)
+
+        if not s:
+
+            return
+
+
+
+        trades = self.client.get_my_trades(market_id=market_id, limit=200)
+
+        if not trades:
+
+            return
+
+
+
+        for tr in trades:
+
+            pt = parse_trade(tr, self.client.maker_fee_rate, self.client.taker_fee_rate)
+
+            if not pt:
+
+                continue
+
+            if self._seen_has(market_id, pt.uid):
+
+                continue
+
+            self._seen_add(market_id, pt.uid)
+
+            self.apply_trade(s, pt)
+
+
+
+        self.save_state()
+
+
+
+    def find_order_by_id(self, s: SessionState, order_id: Optional[str]) -> Optional[OrderInfo]:
+
+        if not order_id:
+
+            return None
+
+        for o in [s.yes_buy_order, s.no_buy_order, s.yes_sell_order, s.no_sell_order]:
+
+            if o and o.order_id == order_id:
+
+                return o
+
+        return None
+
+
+
+    def clear_order_ref(self, s: SessionState, o: OrderInfo):
+
+        if s.yes_buy_order is o: s.yes_buy_order = None
+
+        if s.no_buy_order is o: s.no_buy_order = None
+
+        if s.yes_sell_order is o: s.yes_sell_order = None
+
+        if s.no_sell_order is o: s.no_sell_order = None
+
+
+
+    def maybe_mark_filled(self, s: SessionState, o: OrderInfo):
+
+        eps = CONFIG["FILLED_EPS"]
+
+        if o.is_buy:
+
+            if o.total_quote_d() > 0 and (o.filled_quote_d() + eps) >= o.total_quote_d():
+
+                o.status = "filled"
+
+                self.clear_order_ref(s, o)
+
+                tg_log(f"✅ BUY FILLED {o.side} m#{s.market.market_id} @ {o.price}")
+
+        else:
+
+            if o.total_base_d() > 0 and (o.filled_base_d() + eps) >= o.total_base_d():
+
+                o.status = "filled"
+
+                self.clear_order_ref(s, o)
+
+                tg_log(f"✅ SELL FILLED {o.side} m#{s.market.market_id} @ {o.price}")
+
+
+
+    def apply_trade(self, s: SessionState, pt: ParsedTrade):
+
+        side_name = None
+
+        if pt.token_id == s.market.yes_token_id:
+
+            side_name = "YES"
+
+        elif pt.token_id == s.market.no_token_id:
+
+            side_name = "NO"
+
+
+
+        tracked = self.find_order_by_id(s, pt.order_id) if pt.order_id else None
+
+        is_buy = pt.is_buy if pt.is_buy is not None else (tracked.is_buy if tracked else None)
+
+        if side_name is None and tracked:
+
+            side_name = tracked.side
+
+
+
+        if is_buy is None or side_name not in ("YES", "NO"):
+
+            return
+
+
+
+        if tracked:
+
+            tracked.add_fill(pt.quote, pt.base)
+
+            self.maybe_mark_filled(s, tracked)
+
+
+
+        st = s.stats
+
+        st.total_trades += 1
+
+        st.total_volume = str(st.total_volume_d() + pt.quote)
+
+        st.total_fees = str(st.total_fees_d() + pt.fee_quote)
+
+
+
+        if is_buy:
+
+            st.buy_cost = str(st.buy_cost_d() + pt.quote)
+
+            if side_name == "YES":
+
+                s.yes_position = str(Decimal(s.yes_position) + pt.base)
+
+            else:
+
+                s.no_position = str(Decimal(s.no_position) + pt.base)
+
+            
+
+            # 🛡️ 평균 매수가 업데이트
+
+            self._update_avg_buy_price(s, side_name, pt.price, pt.base)
+
+            
+
+            tg_log(f"🎯 FILL BUY {side_name} m#{s.market.market_id}: +{pt.base:.6f} @ {q_price(pt.price)} "
+
+                   f"(${pt.quote:.4f}, fee~${pt.fee_quote:.4f})")
+
+        else:
+
+            st.sell_proceeds = str(st.sell_proceeds_d() + pt.quote)
+
+            if side_name == "YES":
+
+                s.yes_position = str(Decimal(s.yes_position) - pt.base)
+
+                s.yes_budget = str(Decimal(s.yes_budget) + pt.quote)
+
+            else:
+
+                s.no_position = str(Decimal(s.no_position) - pt.base)
+
+                s.no_budget = str(Decimal(s.no_budget) + pt.quote)
+
+            
+
+            # 🛡️ 평균 매수가 비용 차감
+
+            self._update_avg_sell(s, side_name, pt.base)
+
+            
+
+            tg_log(f"🎯 FILL SELL {side_name} m#{s.market.market_id}: -{pt.base:.6f} @ {q_price(pt.price)} "
+
+                   f"(${pt.quote:.4f}, fee~${pt.fee_quote:.4f})")
+
+
+
+        st.recompute_pnl()
+
+
+
+    def reconcile_orders(self, market_id: int):
+
+        if not self.client:
+
+            return
+
+        s = self.sessions.get(market_id)
+
+        if not s:
+
+            return
+
+
+
+        open_orders = self.client.get_my_orders(market_id=market_id, limit=200, status=None)
+
+        open_ids = set()
+
+        for od in open_orders:
+
+            oid = od.get("orderId") or od.get("order_id") or od.get("orderID")
+
+            if oid:
+
+                open_ids.add(str(oid))
+
+
+
+        for o in [s.yes_buy_order, s.no_buy_order, s.yes_sell_order, s.no_sell_order]:
+
+            if not o or o.status != "open":
+
+                continue
+
+            if o.order_id in open_ids:
+
+                continue
+
+
+
+            info = self.get_order_by_id(o.order_id)  # ✅ Wrapper 사용
+
+            if not info:
+
+                o.status = "cancelled"
+
+                self.clear_order_ref(s, o)
+
+                continue
+
+
+
+            status_val = str(info.get("status") or info.get("orderStatus") or "").lower()
+
+            if "fill" in status_val:
+
+                o.status = "filled"
+
+                self.clear_order_ref(s, o)
+
+            elif "cancel" in status_val:
+
+                o.status = "cancelled"
+
+                self.clear_order_ref(s, o)
+
+
+
+        self.save_state()
+
+
+
+    # order ops
+
+    def cancel_buy_with_refund(self, s: SessionState, side_name: str, o: OrderInfo):
+
+        """
+
+        Buy 주문 취소 + Budget refund
+
+        ⚠️ CRITICAL: API로 실제 체결 양을 확인해서 정확히 refund!
+
+        """
+
+        # 1) API로 실제 주문 상태 조회 (Retry 로직 포함)
+
+        order_data = self.get_order_by_id(o.order_id) if self.client else None
+
+        
+
+        if order_data:
+
+            # API에서 실제 filled 양 가져오기
+
+            api_filled_quote = safe_decimal(order_data.get("filled_quote_amount", 0)) or Decimal("0")
+
+            api_filled_base = safe_decimal(order_data.get("filled_base_amount", 0)) or Decimal("0")
+
+            api_status = order_data.get("status", "")
+
+            
+
+            # OrderInfo 업데이트
+
+            o.filled_quote = str(api_filled_quote)
+
+            o.filled_base = str(api_filled_base)
+
+            
+
+            # 2) 체결 완료 확인
+
+            if api_filled_quote > 0:
+
+                # Position 업데이트
+
+                if side_name == "YES":
+
+                    s.yes_position = str(Decimal(s.yes_position) + api_filled_base)
+
+                else:
+
+                    s.no_position = str(Decimal(s.no_position) + api_filled_base)
+
+                
+
+                # Stats 업데이트
+
+                s.stats.buy_cost = str(s.stats.buy_cost_d() + api_filled_quote)
+
+                
+
+                # 평균 매수가 업데이트
+
+                if api_filled_base > 0:
+
+                    avg_price = api_filled_quote / api_filled_base
+
+                    self._update_avg_buy_price(s, side_name, avg_price, api_filled_base)
+
+                
+
+                tg_log(f"✅ {side_name} BUY filled during cancel: {api_filled_base} shares @ ${api_filled_quote:.2f}")
+
+        
+
+        # 3) 취소 시도
+
+        ok = self.client.cancel_order(o.order_id) if self.client else False
+
+        
+
+        # 4) Refund 계산 (실제 filled 반영)
+
+        remaining = max(Decimal("0"), o.total_quote_d() - o.filled_quote_d())
+
+        
+
+        if remaining > 0:
+
+            if side_name == "YES":
+
+                s.yes_budget = str(Decimal(s.yes_budget) + remaining)
+
+            else:
+
+                s.no_budget = str(Decimal(s.no_budget) + remaining)
+
+            tg_log(f"↩️ REFUND {side_name} BUY m#{s.market.market_id}: ${remaining:.4f}")
+
+        
+
+        # 5) 주문 상태 업데이트
+
+        if o.filled_quote_d() >= o.total_quote_d() * Decimal("0.99"):
+
+            o.status = "filled"
+
+        else:
+
+            o.status = "cancelled"
+
+        
+
+        self.clear_order_ref(s, o)
+
+        
+
+        if ok:
+
+            tg_log(f"🧹 CANCEL BUY {side_name} m#{s.market.market_id} @ {o.price}")
+
+
+
+    def cancel_sell(self, s: SessionState, side_name: str, o: OrderInfo):
+
+        ok = self.client.cancel_order(o.order_id) if self.client else False
+
+        o.status = "cancelled"
+
+        self.clear_order_ref(s, o)
+
+        if ok:
+
+            tg_log(f"🧹 CANCEL SELL {side_name} m#{s.market.market_id} @ {o.price}")
+
+
+
+    def cancel_session_orders(self, market_id: int, refund: bool = True):
+
+        s = self.sessions.get(market_id)
+
+        if not s or not self.client:
+
+            return
+
+
+
+        for side_name, o in [
+
+            ("YES", s.yes_buy_order), ("NO", s.no_buy_order),
+
+            ("YES", s.yes_sell_order), ("NO", s.no_sell_order),
+
+        ]:
+
+            if not o or o.status != "open":
+
+                continue
+
+            if o.is_buy and refund:
+
+                self.cancel_buy_with_refund(s, side_name, o)
+
+            else:
+
+                self.cancel_sell(s, side_name, o)
+
+
+
+        tg_log(f"🗑️ Session orders cancelled m#{market_id}")
+
+
+
+    def guard_block(self, market_id: int, label: str, msg: str) -> bool:
+
+        if not CONFIG["MAKER_ONLY_GUARD"]:
+
+            return False
+
+        key = f"{market_id}:{label}"
+
+        now = time.time()
+
+        last = self._last_guard_log.get(key, 0.0)
+
+        if now - last >= CONFIG["GUARD_LOG_THROTTLE_SEC"]:
+
+            self._last_guard_log[key] = now
+
+            tg_log(msg)
+
+        return True
+
+
+
+    # main per-market decision
+
+    def manage_market(self, market_id: int):
+
+        if not self.client:
+
+            return
+
+        s = self.sessions.get(market_id)
+
+        if not s:
+
+            return
+
+
+
+        self._manage_side(s, "YES")
+
+        self._manage_side(s, "NO")
+
+        self.save_state()
+
+
+
+    def _manage_side(self, s: SessionState, side_name: str):
+
+        # 🛡️ 사이드별 일시정지 체크
+
+        if side_name == "YES" and s.yes_side_paused:
+
+            return
+
+        if side_name == "NO" and s.no_side_paused:
+
+            return
+
+        
+
+        token_id = s.market.yes_token_id if side_name == "YES" else s.market.no_token_id
+
+        budget = Decimal(s.yes_budget) if side_name == "YES" else Decimal(s.no_budget)
+
+        position = Decimal(s.yes_position) if side_name == "YES" else Decimal(s.no_position)
+
+
+
+        best_bid, best_ask = self.client.get_best_prices(token_id)
+
+
+
+        # 🛡️ 급락 감지
+
+        self._check_price_drop_alert(s, side_name, best_ask)
+
+
+
+        # 1) if buy order open, keep it at best_bid
+
+        buy_order = s.yes_buy_order if side_name == "YES" else s.no_buy_order
+
+        if buy_order and buy_order.status == "open":
+
+            if best_bid is not None:
+
+                target = q_price(best_bid)
+
+                if q_price(buy_order.price_d()) != target:
+
+                    # Pushed 감지! 취소 후 즉시 재주문
+
+                    tg_log(f"📉 {side_name} BUY pushed m#{s.market.market_id}: {buy_order.price} != best_bid {target}")
+
+                    self.cancel_buy_with_refund(s, side_name, buy_order)
+
+                    
+
+                    # 🔄 재주문 전 position 재확인 (체결되었을 수 있음)
+
+                    position = Decimal(s.yes_position) if side_name == "YES" else Decimal(s.no_position)
+
+                    if position >= CONFIG["MIN_ORDER_SIZE"]:
+
+                        # Position이 생겼다 = 체결됨! buy 하지 않고 다음 루프에서 sell 로직으로
+
+                        tg_log(f"✅ {side_name} BUY filled during push check, switching to SELL mode")
+
+                        return
+
+                    
+
+                    # Position 없으면 즉시 재주문
+
+                    if budget >= CONFIG["MIN_ORDER_SIZE"]:
+
+                        my_price = q_price(best_bid)
+
+                        my_price = max(Decimal("0.01"), min(my_price, Decimal("0.99")))
+
+                        
+
+                        # Maker-only guard 체크
+
+                        if CONFIG["MAKER_ONLY_GUARD"] and best_ask is not None and best_ask <= best_bid:
+
+                            self.guard_block(s.market.market_id, f"{side_name}:BUY",
+
+                                           f"🧷 Guard: skip {side_name} BUY m#{s.market.market_id} (재주문)")
+
+                        else:
+
+                            self.place_buy(s, side_name, token_id, budget, my_price, best_bid)
+
+                    return
+
+                else:
+
+                    # 가격이 맞으면 유지
+
+                    return
+
+            else:
+
+                # best_bid가 없으면 유지
+
+                return
+
+
+
+        # 2) if position exists, manage sell at best_ask
+
+        sell_order = s.yes_sell_order if side_name == "YES" else s.no_sell_order
+
+        if position >= CONFIG["MIN_ORDER_SIZE"]:
+
+            if sell_order and sell_order.status == "open":
+
+                if best_ask is not None:
+
+                    target = q_price(best_ask)
+
+                    if q_price(sell_order.price_d()) != target:
+
+                        # SELL Pushed 감지! 취소 후 즉시 재주문
+
+                        tg_log(f"📈 {side_name} SELL pushed m#{s.market.market_id}: {sell_order.price} != best_ask {target}")
+
+                        self.cancel_sell(s, side_name, sell_order)
+
+                        
+
+                        # 🔄 즉시 재주문: 밀렸을 때의 best_ask로!
+
+                        # 매도 보호 체크
+
+                        if self._check_sell_protection(s, side_name, best_ask):
+
+                            # 보호 발동, 재주문 안 함
+
+                            return
+
+                        
+
+                        # Maker-only guard 체크
+
+                        if CONFIG["MAKER_ONLY_GUARD"] and best_bid is not None and best_bid >= best_ask:
+
+                            self.guard_block(s.market.market_id, f"{side_name}:SELL",
+
+                                           f"🧷 Guard: skip {side_name} SELL m#{s.market.market_id} (재주문)")
+
+                        else:
+
+                            my_price = q_price(best_ask)
+
+                            self.place_sell(s, side_name, token_id, position, my_price, best_ask)
+
+                        return
+
+                    else:
+
+                        # 가격이 맞으면 유지
+
+                        return
+
+                else:
+
+                    # best_ask가 없으면 유지
+
+                    return
+
+
+
+            if best_ask is None:
+
+                return
+
+
+
+            # 🛡️ 매도 보호 체크: 손실이 너무 크면 매도 거부
+
+            if self._check_sell_protection(s, side_name, best_ask):
+
+                return  # 보호 발동, 매도 안 함
+
+
+
+            # soft post-only guard
+
+            if CONFIG["MAKER_ONLY_GUARD"] and best_bid is not None and best_bid >= best_ask:
+
+                self.guard_block(s.market.market_id, f"{side_name}:SELL",
+
+                                 f"🧷 Guard: skip {side_name} SELL m#{s.market.market_id}")
+
+                return
+
+
+
+            my_price = q_price(best_ask)
+
+            self.place_sell(s, side_name, token_id, position, my_price, best_ask)
+
+            return
+
+
+
+        # 3) no position => place buy if budget sufficient
+
+        if budget < CONFIG["MIN_ORDER_SIZE"]:
+
+            return
+
+        if best_bid is None:
+
+            return
+
+
+
+        if CONFIG["MAKER_ONLY_GUARD"] and best_ask is not None and best_ask <= best_bid:
+
+            self.guard_block(s.market.market_id, f"{side_name}:BUY",
+
+                             f"🧷 Guard: skip {side_name} BUY m#{s.market.market_id}")
+
+            return
+
+
+
+        my_price = q_price(best_bid)
+
+        my_price = max(Decimal("0.01"), min(my_price, Decimal("0.99")))
+
+        self.place_buy(s, side_name, token_id, budget, my_price, best_bid)
+
+
+
+    def place_buy(self, s: SessionState, side_name: str, token_id: str,
+
+                  budget: Decimal, my_price: Decimal, best_bid: Optional[Decimal]):
+
+        order_id = self.client.place_limit_order(
+
+            market_id=s.market.market_id,
+
+            token_id=token_id,
+
+            is_buy=True,
+
+            price=my_price,
+
+            amount=budget,
+
+            is_quote_token=True,
+
+        )
+
+        if not order_id:
+
+            return
+
+        o = OrderInfo(
+
+            order_id=order_id,
+
+            token_id=token_id,
+
+            side=side_name,
+
+            is_buy=True,
+
+            price=str(my_price),
+
+            total_quote=str(budget),
+
+            total_base=str(budget / my_price if my_price > 0 else Decimal("0")),
+
+            filled_quote="0",
+
+            filled_base="0",
+
+            status="open",
+
+        )
+
+        if side_name == "YES":
+
+            s.yes_buy_order = o
+
+            s.yes_budget = "0"
+
+        else:
+
+            s.no_buy_order = o
+
+            s.no_budget = "0"
+
+
+
+        tg_log(f"📥 {side_name} BUY m#{s.market.market_id}: ${budget:.2f} @ {my_price} (best_bid: {best_bid})")
+
+
+
+    def place_sell(self, s: SessionState, side_name: str, token_id: str,
+
+                   position: Decimal, my_price: Decimal, best_ask: Optional[Decimal]):
+
+        order_id = self.client.place_limit_order(
+
+            market_id=s.market.market_id,
+
+            token_id=token_id,
+
+            is_buy=False,
+
+            price=my_price,
+
+            amount=position,
+
+            is_quote_token=False,
+
+        )
+
+        if not order_id:
+
+            return
+
+        o = OrderInfo(
+
+            order_id=order_id,
+
+            token_id=token_id,
+
+            side=side_name,
+
+            is_buy=False,
+
+            price=str(my_price),
+
+            total_quote=str(position * my_price),
+
+            total_base=str(position),
+
+            filled_quote="0",
+
+            filled_base="0",
+
+            status="open",
+
+        )
+
+        if side_name == "YES":
+
+            s.yes_sell_order = o
+
+        else:
+
+            s.no_sell_order = o
+
+
+
+        tg_log(f"📤 {side_name} SELL m#{s.market.market_id}: {position:.6f} @ {my_price} (best_ask: {best_ask})")
+
+
+
+    # kill switch
+
+    def kill_switch(self):
+
+        if not self.client:
+
+            return
+
+
+
+        tg_log("🚨 KILL SWITCH: stopping all strategies...")
+
+        with self._lock:
+
+            mids = list(self.sessions.keys())
+
+            for mid in mids:
+
+                self.sessions[mid].state = BotState.STOPPING.value
+
+
+
+        for mid in mids:
+
+            try:
+
+                self.cancel_session_orders(mid, refund=True)
+
+            except:
+
+                pass
+
+
+
+        tg_log("🚨 KILL SWITCH: cancelling ALL orders across ALL markets...")
+
+        pages = 0
+
+        total_markets = 0
+
+        cancelled_ok = 0
+
+
+
+        for page in range(1, CONFIG["KILL_MAX_PAGES"] + 1):
+
+            markets = self.client.get_markets(page=page, limit=CONFIG["KILL_MARKET_PAGE_LIMIT"])
+
+            if not markets:
+
+                break
+
+            pages += 1
+
+            total_markets += len(markets)
+
+            for m in markets:
+
+                if self.client.cancel_all_orders(m.market_id):
+
+                    cancelled_ok += 1
+
+            tg_log(f"… kill sweep page {page}, markets={len(markets)}")
+
+
+
+        tg_log(f"✅ KILL DONE: swept {total_markets} markets")
+
+
+
+        with self._lock:
+
+            self.sessions.clear()
+
+            self._seen_sets.clear()
+
+            self._seen_deques.clear()
+
+
+
+        try:
+
+            if os.path.exists(CONFIG["STATE_FILE"]):
+
+                os.remove(CONFIG["STATE_FILE"])
+
+        except:
+
+            pass
+
+
+
+        tg_log("🧹 All sessions cleared")
+
+
+
+    # status
+
+    def summary(self) -> Dict[str, Any]:
+
+        with self._lock:
+
+            mids = list(self.sessions.keys())
+
+
+
+        total_vol = Decimal("0")
+
+        total_fee = Decimal("0")
+
+        total_pnl = Decimal("0")
+
+        total_trades = 0
+
+        total_protections = 0
+
+
+
+        for mid in mids:
+
+            s = self.sessions.get(mid)
+
+            if not s:
+
+                continue
+
+            total_vol += s.stats.total_volume_d()
+
+            total_fee += s.stats.total_fees_d()
+
+            total_pnl += s.stats.realized_pnl_d()
+
+            total_trades += s.stats.total_trades
+
+            total_protections += s.protection_triggered_count
+
+
+
+        return {
+
+            "sessions": len(mids),
+
+            "market_ids": mids,
+
+            "volume": float(total_vol),
+
+            "fees": float(total_fee),
+
+            "pnl": float(total_pnl),
+
+            "trades": total_trades,
+
+            "protections": total_protections,
+
+        }
+
+
+
+    def session_status(self, market_id: int) -> Optional[Dict[str, Any]]:
+
+        s = self.sessions.get(market_id)
+
+        if not s:
+
+            return None
+
+        return {
+
+            "state": s.state,
+
+            "market_id": s.market.market_id,
+
+            "title": s.market.title,
+
+            "yes_budget": float(Decimal(s.yes_budget)),
+
+            "no_budget": float(Decimal(s.no_budget)),
+
+            "yes_position": float(Decimal(s.yes_position)),
+
+            "no_position": float(Decimal(s.no_position)),
+
+            "yes_avg_buy": float(Decimal(s.yes_avg_buy_price)),
+
+            "no_avg_buy": float(Decimal(s.no_avg_buy_price)),
+
+            "yes_buy": s.yes_buy_order.price if s.yes_buy_order else None,
+
+            "no_buy": s.no_buy_order.price if s.no_buy_order else None,
+
+            "yes_sell": s.yes_sell_order.price if s.yes_sell_order else None,
+
+            "no_sell": s.no_sell_order.price if s.no_sell_order else None,
+
+            "yes_paused": s.yes_side_paused,
+
+            "no_paused": s.no_side_paused,
+
+            "volume": float(s.stats.total_volume_d()),
+
+            "fees": float(s.stats.total_fees_d()),
+
+            "pnl": float(s.stats.realized_pnl_d()),
+
+            "trades": s.stats.total_trades,
+
+            "protections": s.protection_triggered_count,
+
+        }
+
+
+
+# ============================================================
+
+# Telegram controller
+
+# ============================================================
+
+class TelegramController:
+
+    def __init__(self, mgr: StrategyManager):
+
+        self.mgr = mgr
+
+        self.updater = None
+
+        self._markets_cache: List[MarketInfo] = []
+
+
+
+    def _auth(self, update) -> bool:
+
+        if str(update.effective_chat.id) != str(CONFIG["TELEGRAM_CHAT_ID"]):
+
+            if update.message:
+
+                update.message.reply_text("⛔")
+
+            return False
+
+        return True
+
+
+
+    def cmd_start(self, update, context):
+
+        if not self._auth(update): return
+
+        update.message.reply_text("🤖 Opinion Volume Bot v4.2\n/help\n🛡️ Loss protection enabled")
+
+
+
+    def cmd_help(self, update, context):
+
+        if not self._auth(update): return
+
+        update.message.reply_text(f"""📋 Commands
+
+
+
+/markets - Market list
+
+/market <id> - Market detail
+
+
+
+/run <id> <budget> - Start
+
+/stop [id] - Stop
+
+/pause <id> /resume <id>
+
+/unpause <id> <yes|no> - Unpause protected side
+
+
+
+/status [id] - Status
+
+/volume [id] /fee [id] /pnl [id] /stats [id]
+
+
+
+/sellall - Sell all positions at best_ask
+
+/kill - 🚨 KILL SWITCH
+
+
+
+⚙️ Settings:
+
+  Allocation: {CONFIG['BUDGET_ALLOCATION_MODE']} ({float(CONFIG['DYNAMIC_RATIO_MIN'])*100:.0f}~{float(CONFIG['DYNAMIC_RATIO_MAX'])*100:.0f}%)
+
+  Max loss: {CONFIG['MAX_LOSS_TICKS']} ticks
+
+  Session limit: {CONFIG['MAX_SESSION_LOSS_RATE']*100:.0f}%
+
+""")
+
+
+
+    def cmd_markets(self, update, context):
+
+        if not self._auth(update): return
+
+        if not self.mgr.client:
+
+            update.message.reply_text("❌ client not ready")
+
+            return
+
+        
+
+        # 전체 마켓 가져오기 (v2.3 스타일 - 모든 페이지 순회)
+
+        self._markets_cache = []
+
+        page = 1
+
+        while True:
+
+            markets = self.mgr.client.get_markets(page=page, limit=20)
+
+            if not markets:
+
+                break
+
+            self._markets_cache.extend(markets)
+
+            if len(markets) < 20:
+
+                break
+
+            page += 1
+
+        
+
+        if not self._markets_cache:
+
+            update.message.reply_text("❌ No markets")
+
+            return
+
+        text, kb = self._format_page(0)
+
+        update.message.reply_text(text, reply_markup=kb)
+
+
+
+    def _format_page(self, page: int):
+
+        per = 10
+
+        total = (len(self._markets_cache) + per - 1) // per
+
+        start = page * per
+
+        end = min((page + 1) * per, len(self._markets_cache))
+
+
+
+        text = f"📊 Markets ({page+1}/{total})\n\n"
+
+        for m in self._markets_cache[start:end]:
+
+            title = m.title.replace("\n", " ")
+
+            text += f"[{m.market_id}] {title[:42]}\n"
+
+
+
+        btns = []
+
+        if page > 0:
+
+            btns.append(InlineKeyboardButton("⬅️", callback_data=f"p_{page-1}"))
+
+        if page < total - 1:
+
+            btns.append(InlineKeyboardButton("➡️", callback_data=f"p_{page+1}"))
+
+        return text, InlineKeyboardMarkup([btns]) if btns else None
+
+
+
+    def callback_page(self, update, context):
+
+        q = update.callback_query
+
+        if not self._auth(update): return
+
+        q.answer()
+
+        page = int(q.data.split("_")[1])
+
+        text, kb = self._format_page(page)
+
+        q.edit_message_text(text, reply_markup=kb)
+
+
+
+    def cmd_market(self, update, context):
+
+        if not self._auth(update): return
+
+        if not context.args:
+
+            update.message.reply_text("/market <id>")
+
+            return
+
+        if not self.mgr.client:
+
+            update.message.reply_text("❌ client not ready")
+
+            return
+
+        
+
+        target_id = int(context.args[0])
+
+        
+
+        def to_price(p: Optional[Decimal]) -> str:
+
+            if p is None:
+
+                return "N/A"
+
+            return f"${float(p):.4f}"
+
+
+
+        # 🎯 get_markets()로 전체 목록 가져오기 (child_markets 포함)
+
+        try:
+
+            all_markets = []
+
+            for page in range(1, 21):  # 최대 20페이지
+
+                markets = self.mgr.client.get_markets(page=page, limit=20)
+
+                if not markets:
+
+                    break
+
+                all_markets.extend(markets)
+
+                if len(markets) < 20:
+
+                    break
+
+            
+
+            tg_log(f"📋 Retrieved {len(all_markets)} total markets")
+
+            
+
+            # target_id가 parent인지 child인지 확인
+
+            target_market = None
+
+            parent_market = None
+
+            
+
+            # 1. target_id가 parent market_id와 일치하는지 확인
+
+            for m in all_markets:
+
+                if m.market_id == target_id:
+
+                    if m.sub_markets:
+
+                        # Parent 발견!
+
+                        target_market = m
+
+                        tg_log(f"✅ Found parent market #{target_id} with {len(m.sub_markets)} children")
+
+                        break
+
+                    else:
+
+                        # ID는 맞는데 sub_markets가 없음 (child일 수도)
+
+                        target_market = m
+
+            
+
+            # 2. target_id가 child의 outcome_id인지 확인
+
+            if not target_market or not target_market.sub_markets:
+
+                for m in all_markets:
+
+                    if m.sub_markets:
+
+                        for sub in m.sub_markets:
+
+                            if sub.outcome_id == target_id:
+
+                                parent_market = m
+
+                                tg_log(f"✅ Found as child #{target_id} of parent #{m.market_id}")
+
+                                break
+
+                    if parent_market:
+
+                        break
+
+            
+
+            # 결과 표시
+
+            display_market = parent_market if parent_market else target_market
+
+            
+
+            if display_market and display_market.sub_markets:
+
+                # Multi-outcome market 표시
+
+                text = f"""📊 Topic Market #{display_market.market_id}
+
+📝 {display_market.title}
+
+💰 Total Volume: ${float(display_market.volume):,.2f}
+
+
+
+🎯 Child Markets ({len(display_market.sub_markets)}개):
+
+"""
+
+                for sub in display_market.sub_markets[:20]:
+
+                    # 하위 마켓 오더북 조회
+
+                    if sub.token_id:
+
+                        try:
+
+                            sb, sa = self.mgr.client.get_best_prices(sub.token_id)
+
+                        except:
+
+                            sb, sa = None, None
+
+                    else:
+
+                        sb, sa = None, None
+
+                    
+
+                    chance_str = f" ({float(sub.chance)*100:.1f}%)" if sub.chance else ""
+
+                    highlight = "👉 " if sub.outcome_id == target_id else ""
+
+                    
+
+                    text += f"\n{highlight}[{sub.outcome_id}] {sub.name}{chance_str}"
+
+                    text += f"\n    Vol: ${float(sub.volume):,.0f}"
+
+                    text += f"\n    Bid: {to_price(sb)} | Ask: {to_price(sa)}\n"
+
+                
+
+                if len(display_market.sub_markets) > 20:
+
+                    text += f"\n... +{len(display_market.sub_markets) - 20}개 더"
+
+                
+
+                update.message.reply_text(text)
+
+                
+
+            elif target_market:
+
+                # Binary market (YES/NO)
+
+                # get_market()으로 토큰 정보 가져오기 (어쩔 수 없음)
+
+                m = self.mgr.client.get_market(target_id)
+
+                if not m:
+
+                    update.message.reply_text(f"❌ Cannot fetch market details for #{target_id}")
+
+                    return
+
+                
+
+                try:
+
+                    yb, ya = self.mgr.client.get_best_prices(m.yes_token_id)
+
+                    nb, na = self.mgr.client.get_best_prices(m.no_token_id)
+
+                except:
+
+                    yb, ya, nb, na = None, None, None, None
+
+                
+
+                text = f"""📊 Market #{target_market.market_id}
+
+📝 {target_market.title}
+
+💰 Total Volume: ${float(target_market.volume):,.2f}
+
+
+
+🟢 YES
+
+  Bid: {to_price(yb)} | Ask: {to_price(ya)}
+
+
+
+🔴 NO
+
+  Bid: {to_price(nb)} | Ask: {to_price(na)}"""
+
+                
+
+                update.message.reply_text(text)
+
+            else:
+
+                update.message.reply_text(f"❌ Market #{target_id} not found in {len(all_markets)} markets")
+
+                
+
+        except Exception as e:
+
+            tg_log(f"❌ Error in cmd_market: {e}")
+
+            update.message.reply_text(f"❌ Error: {e}")
+
+
+
+    def cmd_raw(self, update, context):
+
+        """디버그: API raw 응답 확인"""
+
+        if not self._auth(update): return
+
+        if not context.args:
+
+            update.message.reply_text("/raw <market_id>")
+
+            return
+
+        if not self.mgr.client:
+
+            update.message.reply_text("❌ client not ready")
+
+            return
+
+        
+
+        mid = int(context.args[0])
+
+        try:
+
+            resp = self.mgr.client._retry_api_call(
+
+                self.mgr.client.client.get_market, market_id=mid, use_cache=False
+
+            )
+
+            errno, result, errmsg = self.mgr.client._unwrap(resp)
+
+            
+
+            if errno != 0:
+
+                update.message.reply_text(f"❌ errno={errno}, errmsg={errmsg}")
+
+                return
+
+            
+
+            data = getattr(result, "data", result)
+
+            d = obj_to_dict(data)
+
+            
+
+            if not isinstance(d, dict):
+
+                update.message.reply_text(f"❌ Not a dict: {type(d)}")
+
+                return
+
+            
+
+            # 키 목록
+
+            keys = list(d.keys())
+
+            text = f"📦 Raw Market #{mid}\n\nKeys ({len(keys)}):\n"
+
+            text += ", ".join(keys[:30])
+
+            if len(keys) > 30:
+
+                text += f"\n... +{len(keys)-30} more"
+
+            
+
+            # 중요 필드 확인 - None도 표시
+
+            text += "\n\n📌 Key Fields:\n"
+
+            for k in ["question_id", "question_title", "child_markets", "childMarkets", 
+
+                      "outcomes", "options", "marketOptions", "market_options", "sub_markets", 
+
+                      "children", "subMarkets", "markets",
+
+                      "yesTokenId", "noTokenId", "yes_token_id", "no_token_id",
+
+                      "volume", "totalVolume", "total_volume", "marketType", "market_type",
+
+                      "topicTitle", "marketTitle", "title", "market_title"]:
+
+                if k not in d:
+
+                    continue  # 키가 없으면 스킵
+
+                v = d.get(k)
+
+                if v is None:
+
+                    text += f"  {k}: None\n"
+
+                elif isinstance(v, list):
+
+                    text += f"  {k}: list[{len(v)}]"
+
+                    if len(v) == 0:
+
+                        text += " (empty)\n"
+
+                    else:
+
+                        text += "\n"
+
+                        first = obj_to_dict(v[0]) if not isinstance(v[0], dict) else v[0]
+
+                        if isinstance(first, dict):
+
+                            text += f"    first keys: {list(first.keys())[:20]}\n"
+
+                        else:
+
+                            text += f"    first item: {str(first)[:50]}\n"
+
+                else:
+
+                    text += f"  {k}: {str(v)[:80]}\n"
+
+            
+
+            # outcomes/options/child_markets 상세 - 개선된 버전
+
+            for field in ["child_markets", "outcomes", "marketOptions", "market_options", "options", "childMarkets"]:
+
+                items = d.get(field)
+
+                if isinstance(items, list) and items:
+
+                    text += f"\n🔍 {field} details ({len(items)} items):\n"
+
+                    for i, item in enumerate(items[:5]):  # 최대 5개
+
+                        item_d = obj_to_dict(item) if not isinstance(item, dict) else item
+
+                        if isinstance(item_d, dict):
+
+                            # 주요 필드만 추출
+
+                            name = (item_d.get("name") or item_d.get("outcomeName") or 
+
+                                   item_d.get("outcome_name") or item_d.get("title") or 
+
+                                   item_d.get("market_title") or item_d.get("marketTitle") or f"Item {i}")
+
+                            token_id = (item_d.get("tokenId") or item_d.get("token_id") or 
+
+                                       item_d.get("yes_token_id") or item_d.get("yesTokenId") or "N/A")
+
+                            volume = (item_d.get("volume") or item_d.get("totalVolume") or 
+
+                                     item_d.get("total_volume") or "N/A")
+
+                            chance = (item_d.get("chance") or item_d.get("probability") or 
+
+                                     item_d.get("price") or "N/A")
+
+                            market_id = item_d.get("market_id") or item_d.get("marketId") or "N/A"
+
+                            
+
+                            text += f"  [{i}] {name}\n"
+
+                            text += f"      market_id: {market_id}\n"
+
+                            text += f"      token: {str(token_id)[:30]}...\n"
+
+                            text += f"      volume: {volume}, chance: {chance}\n"
+
+                    if len(items) > 5:
+
+                        text += f"  ... +{len(items)-5} more\n"
+
+                    break  # 첫 번째로 찾은 필드만 표시
+
+            
+
+            # 메시지 길이 제한
+
+            if len(text) > 4000:
+
+                text = text[:4000] + "\n... (truncated)"
+
+            
+
+            update.message.reply_text(text)
+
+            
+
+        except Exception as e:
+
+            update.message.reply_text(f"❌ Error: {e}")
+
+
+
+    def cmd_marketsraw(self, update, context):
+
+        """디버그: get_markets raw 응답 확인"""
+
+        if not self._auth(update): return
+
+        if not self.mgr.client:
+
+            update.message.reply_text("❌ client not ready")
+
+            return
+
+        
+
+        try:
+
+            resp = self.mgr.client._retry_api_call(
+
+                self.mgr.client.client.get_markets,
+
+                status=TopicStatusFilter.ACTIVATED,
+
+                page=1,
+
+                limit=3
+
+            )
+
+            errno, result, errmsg = self.mgr.client._unwrap(resp)
+
+            
+
+            if errno != 0:
+
+                update.message.reply_text(f"❌ errno={errno}, errmsg={errmsg}")
+
+                return
+
+            
+
+            # result 구조 확인
+
+            lst = getattr(result, "list", None)
+
+            if lst is None:
+
+                rd = obj_to_dict(result)
+
+                if isinstance(rd, dict):
+
+                    lst = rd.get("list") or rd.get("data") or []
+
+            
+
+            if not lst:
+
+                update.message.reply_text("❌ No markets in response")
+
+                return
+
+            
+
+            # 첫 번째 마켓 상세
+
+            first = lst[0]
+
+            d = obj_to_dict(first)
+
+            
+
+            if not isinstance(d, dict):
+
+                update.message.reply_text(f"❌ Not a dict: {type(d)}")
+
+                return
+
+            
+
+            keys = list(d.keys())
+
+            text = f"📦 Markets Raw (first of {len(lst)})\n\nKeys ({len(keys)}):\n"
+
+            text += ", ".join(keys[:30])
+
+            if len(keys) > 30:
+
+                text += f"\n... +{len(keys)-30} more"
+
+            
+
+            # 중요 필드 확인
+
+            text += "\n\n📌 First Market:\n"
+
+            for k in ["child_markets", "childMarkets", "marketId", "market_id", 
+
+                      "marketTitle", "market_title", "topicId", "topic_id",
+
+                      "volume", "totalVolume", "status"]:
+
+                if k not in d:
+
+                    continue
+
+                v = d.get(k)
+
+                if v is None:
+
+                    text += f"  {k}: None\n"
+
+                elif isinstance(v, list):
+
+                    text += f"  {k}: list[{len(v)}]"
+
+                    if len(v) == 0:
+
+                        text += " (empty)\n"
+
+                    else:
+
+                        text += "\n"
+
+                        if len(v) > 0:
+
+                            first_item = obj_to_dict(v[0]) if not isinstance(v[0], dict) else v[0]
+
+                            if isinstance(first_item, dict):
+
+                                text += f"    first keys: {list(first_item.keys())[:15]}\n"
+
+                            elif isinstance(first_item, (int, str)):
+
+                                text += f"    first items: {v[:5]}\n"
+
+                else:
+
+                    text += f"  {k}: {str(v)[:70]}\n"
+
+            
+
+            # child_markets 상세
+
+            for field in ["child_markets", "childMarkets"]:
+
+                items = d.get(field)
+
+                if isinstance(items, list) and items:
+
+                    text += f"\n🔍 {field} details:\n"
+
+                    for i, item in enumerate(items[:3]):
+
+                        item_d = obj_to_dict(item) if not isinstance(item, dict) else item
+
+                        if isinstance(item_d, dict):
+
+                            name = item_d.get("marketTitle") or item_d.get("market_title") or f"Item {i}"
+
+                            mid = item_d.get("marketId") or item_d.get("market_id") or "N/A"
+
+                            vol = item_d.get("volume") or item_d.get("totalVolume") or "N/A"
+
+                            text += f"  [{i}] {name}\n"
+
+                            text += f"      market_id: {mid}, volume: {vol}\n"
+
+                        elif isinstance(item, (int, str)):
+
+                            text += f"  [{i}] {item}\n"
+
+                    if len(items) > 3:
+
+                        text += f"  ... +{len(items)-3} more\n"
+
+                    break
+
+            
+
+            if len(text) > 4000:
+
+                text = text[:4000] + "\n... (truncated)"
+
+            
+
+            update.message.reply_text(text)
+
+            
+
+        except Exception as e:
+
+            update.message.reply_text(f"❌ Error: {e}")
+
+
+
+    def cmd_topicraw(self, update, context):
+
+        """디버그: Topic API raw 응답 확인"""
+
+        if not self._auth(update): return
+
+        if not context.args:
+
+            update.message.reply_text("/topicraw <market_id>")
+
+            return
+
+        if not self.mgr.client:
+
+            update.message.reply_text("❌ client not ready")
+
+            return
+
+        
+
+        target_id = int(context.args[0])
+
+        
+
+        try:
+
+            # 1. question_id 추출
+
+            resp = self.mgr.client._retry_api_call(
+
+                self.mgr.client.client.get_market, market_id=target_id, use_cache=False
+
+            )
+
+            errno, result, _ = self.mgr.client._unwrap(resp)
+
+            
+
+            if errno != 0:
+
+                update.message.reply_text(f"❌ Failed to get market: errno={errno}")
+
+                return
+
+            
+
+            data = getattr(result, "data", result)
+
+            d = obj_to_dict(data)
+
+            question_id = d.get("question_id") if isinstance(d, dict) else None
+
+            
+
+            if not question_id:
+
+                update.message.reply_text(f"❌ No question_id found")
+
+                return
+
+            
+
+            # 2. Topic API 호출
+
+            import requests
+
+            url = f"{CONFIG['HOST']}/api/bsc/api/v2/topic/{question_id}"
+
+            headers = {"Content-Type": "application/json"}
+
+            if CONFIG.get("API_KEY"):
+
+                headers["APIKEY"] = CONFIG["API_KEY"]
+
+            
+
+            response = requests.get(url, headers=headers, timeout=10)
+
+            
+
+            if response.status_code != 200:
+
+                update.message.reply_text(f"❌ API error: {response.status_code}")
+
+                return
+
+            
+
+            topic_data = response.json()
+
+            
+
+            # 3. 응답 구조 분석
+
+            text = f"📦 Topic API Response\n"
+
+            text += f"question_id: {str(question_id)[:20]}...\n\n"
+
+            
+
+            if isinstance(topic_data, dict):
+
+                keys = list(topic_data.keys())
+
+                text += f"Keys ({len(keys)}):\n"
+
+                text += ", ".join(keys[:20])
+
+                if len(keys) > 20:
+
+                    text += f"\n... +{len(keys)-20} more"
+
+                
+
+                text += "\n\n📌 Fields:\n"
+
+                for k in ["data", "result", "markets", "children", "child_markets", 
+
+                          "childMarkets", "list", "items", "outcomes", "options"]:
+
+                    if k not in topic_data:
+
+                        continue
+
+                    v = topic_data.get(k)
+
+                    if v is None:
+
+                        text += f"  {k}: None\n"
+
+                    elif isinstance(v, list):
+
+                        text += f"  {k}: list[{len(v)}]\n"
+
+                        if len(v) > 0:
+
+                            first = obj_to_dict(v[0]) if not isinstance(v[0], dict) else v[0]
+
+                            if isinstance(first, dict):
+
+                                text += f"    first keys: {list(first.keys())[:15]}\n"
+
+                            else:
+
+                                text += f"    first: {str(first)[:50]}\n"
+
+                    elif isinstance(v, dict):
+
+                        text += f"  {k}: dict\n"
+
+                        sub_keys = list(v.keys())
+
+                        text += f"    keys: {sub_keys[:10]}\n"
+
+                    else:
+
+                        text += f"  {k}: {str(v)[:60]}\n"
+
+                
+
+                # 중첩 구조 체크
+
+                for field in ["data", "result"]:
+
+                    if field in topic_data and isinstance(topic_data[field], dict):
+
+                        text += f"\n🔍 {field} sub-fields:\n"
+
+                        sub = topic_data[field]
+
+                        for k in ["markets", "list", "items", "children"]:
+
+                            if k in sub:
+
+                                v = sub[k]
+
+                                if isinstance(v, list):
+
+                                    text += f"  {field}.{k}: list[{len(v)}]\n"
+
+                                    if len(v) > 0:
+
+                                        first = obj_to_dict(v[0]) if not isinstance(v[0], dict) else v[0]
+
+                                        if isinstance(first, dict):
+
+                                            text += f"    sample: {list(first.keys())[:10]}\n"
+
+            elif isinstance(topic_data, list):
+
+                text += f"Response is list[{len(topic_data)}]\n"
+
+                if topic_data:
+
+                    first = obj_to_dict(topic_data[0]) if not isinstance(topic_data[0], dict) else topic_data[0]
+
+                    if isinstance(first, dict):
+
+                        text += f"First item keys: {list(first.keys())[:15]}\n"
+
+            else:
+
+                text += f"Response type: {type(topic_data)}\n"
+
+            
+
+            if len(text) > 4000:
+
+                text = text[:4000] + "\n... (truncated)"
+
+            
+
+            update.message.reply_text(text)
+
+            
+
+        except Exception as e:
+
+            update.message.reply_text(f"❌ Error: {e}")
+
+
+
+    def cmd_run(self, update, context):
+
+        if not self._auth(update): return
+
+        if len(context.args) < 2:
+
+            update.message.reply_text("/run <market_id> <budget>")
+
+            return
+
+        mid = int(context.args[0])
+
+        budget = Decimal(context.args[1])
+
+        if budget < 2:
+
+            update.message.reply_text("❌ Min budget: $2")
+
+            return
+
+        ok = self.mgr.start_strategy(mid, budget)
+
+        update.message.reply_text("✅ Started!" if ok else "❌ Failed")
+
+
+
+    def cmd_stop(self, update, context):
+
+        if not self._auth(update): return
+
+        if context.args:
+
+            self.mgr.stop_strategy(int(context.args[0]))
+
+            update.message.reply_text("✅ Stopped")
+
+        else:
+
+            self.mgr.stop_strategy(None)
+
+            update.message.reply_text("✅ Stopped all sessions")
+
+
+
+    def cmd_pause(self, update, context):
+
+        if not self._auth(update): return
+
+        if not context.args:
+
+            update.message.reply_text("/pause <market_id>")
+
+            return
+
+        self.mgr.pause_strategy(int(context.args[0]))
+
+        update.message.reply_text("⏸️")
+
+
+
+    def cmd_resume(self, update, context):
+
+        if not self._auth(update): return
+
+        if not context.args:
+
+            update.message.reply_text("/resume <market_id>")
+
+            return
+
+        self.mgr.resume_strategy(int(context.args[0]))
+
+        update.message.reply_text("▶️")
+
+
+
+    def cmd_unpause(self, update, context):
+
+        """보호로 일시정지된 사이드 해제"""
+
+        if not self._auth(update): return
+
+        if len(context.args) < 2:
+
+            update.message.reply_text("/unpause <market_id> <yes|no>")
+
+            return
+
+        mid = int(context.args[0])
+
+        side = context.args[1].upper()
+
+        self.mgr.unpause_side(mid, side)
+
+        update.message.reply_text(f"▶️ {side} side unpaused")
+
+
+
+    def cmd_kill(self, update, context):
+
+        if not self._auth(update): return
+
+        update.message.reply_text("🚨 KILL SWITCH executing...")
+
+        self.mgr.kill_switch()
+
+        update.message.reply_text("✅ KILL DONE")
+
+
+
+    def cmd_sellall(self, update, context):
+
+        """
+
+        실제 API로 모든 position 조회 후 best_ask 가격에 매도
+
+        - get_my_positions() API 사용
+
+        - YES/NO token 모두 확인
+
+        - 각 position을 best_ask 가격에 매도 리미트 오더
+
+        - 메이커 온리 (최상단 호가 유지)
+
+        """
+
+        if not self._auth(update): return
+
+        if not self.mgr.client:
+
+            update.message.reply_text("❌ Client not ready")
+
+            return
+
+        
+
+        update.message.reply_text("🔍 Checking positions via API...")
+
+        
+
+        # 1) 실제 API로 모든 position 조회
+
+        try:
+
+            positions_data = self.mgr.client.get_my_positions(limit=100)
+
+        except Exception as e:
+
+            update.message.reply_text(f"❌ API error: {str(e)[:100]}")
+
+            return
+
+        
+
+        if not positions_data:
+
+            update.message.reply_text("✅ No positions found")
+
+            return
+
+        
+
+        # 2) Position 데이터 파싱
+
+        sell_targets = []
+
+        for pos in positions_data:
+
+            try:
+
+                # Position 데이터 구조 파싱
+
+                token_id = str(pos.get("token_id") or pos.get("tokenId") or "")
+
+                amount_str = str(pos.get("amount") or pos.get("balance") or "0")
+
+                
+
+                if not token_id:
+
+                    continue
+
+                
+
+                # Amount를 Decimal로 변환 (18 decimals)
+
+                try:
+
+                    amount = Decimal(amount_str) / Decimal(10**18)
+
+                except:
+
+                    continue
+
+                
+
+                if amount < CONFIG["MIN_ORDER_SIZE"]:
+
+                    continue
+
+                
+
+                # Market 정보 조회
+
+                market_id = pos.get("market_id") or pos.get("marketId")
+
+                
+
+                # Token ID로 market 찾기 (세션에서)
+
+                found_session = None
+
+                found_side = None
+
+                
+
+                for mid, s in self.mgr.sessions.items():
+
+                    if s.market.yes_token_id == token_id:
+
+                        found_session = s
+
+                        found_side = "YES"
+
+                        break
+
+                    elif s.market.no_token_id == token_id:
+
+                        found_session = s
+
+                        found_side = "NO"
+
+                        break
+
+                
+
+                # 세션에 없으면 market_id로 market 조회
+
+                if not found_session and market_id:
+
+                    try:
+
+                        market = self.mgr.client.get_market(int(market_id))
+
+                        if market:
+
+                            # 임시 세션 생성 (매도용)
+
+                            if market.yes_token_id == token_id:
+
+                                found_side = "YES"
+
+                            elif market.no_token_id == token_id:
+
+                                found_side = "NO"
+
+                            
+
+                            if found_side:
+
+                                sell_targets.append({
+
+                                    "market_id": int(market_id),
+
+                                    "market": market,
+
+                                    "side": found_side,
+
+                                    "token_id": token_id,
+
+                                    "amount": amount,
+
+                                    "session": None
+
+                                })
+
+                    except:
+
+                        pass
+
+                
+
+                elif found_session and found_side:
+
+                    sell_targets.append({
+
+                        "market_id": found_session.market.market_id,
+
+                        "market": found_session.market,
+
+                        "side": found_side,
+
+                        "token_id": token_id,
+
+                        "amount": amount,
+
+                        "session": found_session
+
+                    })
+
+                    
+
+            except Exception as e:
+
+                continue
+
+        
+
+        if not sell_targets:
+
+            update.message.reply_text("✅ No valid positions to sell")
+
+            return
+
+        
+
+        # 3) 매도 주문 실행
+
+        msg = f"🔄 Selling {len(sell_targets)} positions:\n"
+
+        success = 0
+
+        failed = 0
+
+        
+
+        for target in sell_targets:
+
+            market_id = target["market_id"]
+
+            side = target["side"]
+
+            token_id = target["token_id"]
+
+            amount = target["amount"]
+
+            market = target["market"]
+
+            session = target["session"]
+
+            
+
+            try:
+
+                # 세션이 있으면 기존 매도 주문 취소
+
+                if session:
+
+                    sell_order = session.yes_sell_order if side == "YES" else session.no_sell_order
+
+                    if sell_order and sell_order.status == "open":
+
+                        self.mgr.cancel_sell(session, side, sell_order)
+
+                
+
+                # Best prices 조회
+
+                best_bid, best_ask = self.mgr.client.get_best_prices(token_id)
+
+                
+
+                if not best_ask:
+
+                    msg += f"\n⚠️ m#{market_id} {side}: No best_ask"
+
+                    failed += 1
+
+                    continue
+
+                
+
+                # 매도 가격 계산 (best_ask)
+
+                my_price = q_price(best_ask)
+
+                my_price = max(Decimal("0.01"), min(my_price, Decimal("0.99")))
+
+                
+
+                # 세션이 있으면 매도 보호 체크
+
+                if session and self.mgr._check_sell_protection(session, side, best_ask):
+
+                    msg += f"\n🛡️ m#{market_id} {side}: Sell protection (price too low)"
+
+                    failed += 1
+
+                    continue
+
+                
+
+                # Maker-only guard 체크
+
+                if CONFIG["MAKER_ONLY_GUARD"] and best_bid is not None and best_bid >= best_ask:
+
+                    msg += f"\n🧷 m#{market_id} {side}: Guard block (crossed spread)"
+
+                    failed += 1
+
+                    continue
+
+                
+
+                # 매도 주문 실행
+
+                if session:
+
+                    # 세션이 있으면 place_sell 사용
+
+                    self.mgr.place_sell(session, side, token_id, amount, my_price, best_ask)
+
+                else:
+
+                    # 세션 없으면 직접 주문
+
+                    try:
+
+                        order_resp = self.mgr.client.place_order(
+
+                            token_id=token_id,
+
+                            side="SELL",
+
+                            amount=int(amount * Decimal(10**18)),  # Convert to wei
+
+                            price=float(my_price) / 100,  # Convert cents to decimal
+
+                            order_type="LIMIT"
+
+                        )
+
+                        if order_resp:
+
+                            msg += f"\n📤 m#{market_id} {side}: {amount:.2f} @ {my_price}¢"
+
+                            success += 1
+
+                        else:
+
+                            msg += f"\n❌ m#{market_id} {side}: Order failed"
+
+                            failed += 1
+
+                    except Exception as e:
+
+                        msg += f"\n❌ m#{market_id} {side}: {str(e)[:40]}"
+
+                        failed += 1
+
+                    continue
+
+                
+
+                msg += f"\n📤 m#{market_id} {side}: {amount:.2f} @ {my_price}¢"
+
+                success += 1
+
+                
+
+            except Exception as e:
+
+                msg += f"\n❌ m#{market_id} {side}: {str(e)[:40]}"
+
+                failed += 1
+
+        
+
+        msg += f"\n\n✅ Success: {success} | ❌ Failed: {failed}"
+
+        update.message.reply_text(msg)
+
+
+
+    def cmd_status(self, update, context):
+
+        if not self._auth(update): return
+
+        if context.args:
+
+            mid = int(context.args[0])
+
+            s = self.mgr.session_status(mid)
+
+            if not s:
+
+                update.message.reply_text("❌ No session")
+
+                return
+
+            
+
+            yes_status = "⏸️" if s['yes_paused'] else "▶️"
+
+            no_status = "⏸️" if s['no_paused'] else "▶️"
+
+            
+
+            update.message.reply_text(
+
+                f"📈 Status m#{s['market_id']} ({s['state']})\n\n"
+
+                f"{yes_status} YES: budget ${s['yes_budget']:.4f} | pos {s['yes_position']:.6f} | avg_buy {s['yes_avg_buy']:.4f}\n"
+
+                f"{no_status} NO:  budget ${s['no_budget']:.4f} | pos {s['no_position']:.6f} | avg_buy {s['no_avg_buy']:.4f}\n\n"
+
+                f"Orders:\n"
+
+                f"  YES B {s['yes_buy']} / S {s['yes_sell']}\n"
+
+                f"  NO  B {s['no_buy']} / S {s['no_sell']}\n\n"
+
+                f"Vol ${s['volume']:.4f} | Fills {s['trades']} | Fees ${s['fees']:.4f} | PnL ${s['pnl']:.4f}\n"
+
+                f"🛡️ Protection triggers: {s['protections']}"
+
+            )
+
+        else:
+
+            sm = self.mgr.summary()
+
+            update.message.reply_text(
+
+                f"📊 Summary\n"
+
+                f"Sessions: {sm['sessions']} | Markets: {sm['market_ids']}\n"
+
+                f"Volume: ${sm['volume']:,.4f} | Fills: {sm['trades']}\n"
+
+                f"Fees:   ${sm['fees']:,.4f}\n"
+
+                f"PnL:    ${sm['pnl']:,.4f}\n"
+
+                f"🛡️ Protection triggers: {sm['protections']}"
+
+            )
+
+
+
+    def _metric_cmd(self, update, context, which: str):
+
+        if not self._auth(update): return
+
+        if context.args:
+
+            mid = int(context.args[0])
+
+            s = self.mgr.session_status(mid)
+
+            if not s:
+
+                update.message.reply_text("❌ No session")
+
+                return
+
+            mapping = {
+
+                "volume": f"${s['volume']:,.4f} | fills {s['trades']}",
+
+                "fee":    f"${s['fees']:,.4f}",
+
+                "pnl":    f"${s['pnl']:,.4f}",
+
+                "stats":  f"Vol ${s['volume']:,.4f} | Fills {s['trades']} | Fees ${s['fees']:,.4f} | PnL ${s['pnl']:,.4f}",
+
+            }
+
+            update.message.reply_text(f"{which.upper()} m#{mid}: {mapping[which]}")
+
+        else:
+
+            sm = self.mgr.summary()
+
+            mapping = {
+
+                "volume": f"${sm['volume']:,.4f} | fills {sm['trades']}",
+
+                "fee":    f"${sm['fees']:,.4f}",
+
+                "pnl":    f"${sm['pnl']:,.4f}",
+
+                "stats":  f"Vol ${sm['volume']:,.4f} | Fills {sm['trades']} | Fees ${sm['fees']:,.4f} | PnL ${sm['pnl']:,.4f}",
+
+            }
+
+            update.message.reply_text(f"{which.upper()} ALL: {mapping[which]}")
+
+
+
+    def cmd_volume(self, update, context): self._metric_cmd(update, context, "volume")
+
+    def cmd_fee(self, update, context): self._metric_cmd(update, context, "fee")
+
+    def cmd_pnl(self, update, context): self._metric_cmd(update, context, "pnl")
+
+    def cmd_stats(self, update, context): self._metric_cmd(update, context, "stats")
+
+
+
+    def start(self):
+
+        if not TELEGRAM_AVAILABLE or not CONFIG["TELEGRAM_BOT_TOKEN"]:
+
+            print("❌ Telegram not configured")
+
+            return
+
+
+
+        tg_logger.setup(CONFIG["TELEGRAM_BOT_TOKEN"], str(CONFIG["TELEGRAM_CHAT_ID"]))
+
+
+
+        self.updater = Updater(token=CONFIG["TELEGRAM_BOT_TOKEN"], use_context=True)
+
+        dp = self.updater.dispatcher
+
+
+
+        dp.add_handler(CommandHandler("start", self.cmd_start))
+
+        dp.add_handler(CommandHandler("help", self.cmd_help))
+
+        dp.add_handler(CommandHandler("markets", self.cmd_markets))
+
+        dp.add_handler(CommandHandler("market", self.cmd_market))
+
+        dp.add_handler(CommandHandler("raw", self.cmd_raw))
+
+        dp.add_handler(CommandHandler("marketsraw", self.cmd_marketsraw))
+
+        dp.add_handler(CommandHandler("topicraw", self.cmd_topicraw))
+
+
+
+        dp.add_handler(CommandHandler("run", self.cmd_run))
+
+        dp.add_handler(CommandHandler("stop", self.cmd_stop))
+
+        dp.add_handler(CommandHandler("pause", self.cmd_pause))
+
+        dp.add_handler(CommandHandler("resume", self.cmd_resume))
+
+        dp.add_handler(CommandHandler("unpause", self.cmd_unpause))
+
+
+
+        dp.add_handler(CommandHandler("status", self.cmd_status))
+
+        dp.add_handler(CommandHandler("volume", self.cmd_volume))
+
+        dp.add_handler(CommandHandler("fee", self.cmd_fee))
+
+        dp.add_handler(CommandHandler("pnl", self.cmd_pnl))
+
+        dp.add_handler(CommandHandler("stats", self.cmd_stats))
+
+
+
+        dp.add_handler(CommandHandler("kill", self.cmd_kill))
+
+        dp.add_handler(CommandHandler("sellall", self.cmd_sellall))
+
+        dp.add_handler(CallbackQueryHandler(self.callback_page, pattern=r"^p_"))
+
+
+
+        print("🤖 Telegram bot starting (non-blocking mode)...")
+
+        
+
+        # ✅ Non-blocking 방식: start_polling()만 호출
+
+        # idle()를 호출하지 않아 Jupyter 커널이 블로킹되지 않음
+
+        self.updater.start_polling()
+
+        
+
+        print("✅ Telegram bot started! (Jupyter-friendly mode)")
+
+        print("💡 Bot is running in background. Use other cells freely!")
+
+        print("⚠️ To stop: Run 'tg.stop()' in a new cell")
+
+
+
+    def stop(self):
+
+        tg_logger.stop()
+
+        if self.updater:
+
+            self.updater.stop()
+
+
+
+# ============================================================
+
+# main
+
+# ============================================================
+
+mgr: Optional[StrategyManager] = None
+
+tg: Optional[TelegramController] = None
+
+
+
+def run_bot():
+
+    """
+
+    Jupyter-friendly non-blocking 봇 실행
+
+    - 메인 스레드를 블로킹하지 않음
+
+    - 다른 셀 실행 가능
+
+    """
+
+    global mgr, tg
+
+
+
+    if not ENV_OK:
+
+        print("❌ 환경변수 설정 필요")
+
+        return
+
+
+
+    print("🚀 Opinion Volume Bot v4.3.7 (Jupyter-Optimized)")
+
+
+
+    mgr = StrategyManager()
+
+    if not mgr.initialize():
+
+        print("❌ Init failed")
+
+        return
+
+
+
+    mgr.restore_state()
+
+    mgr.start_loop()  # Background thread
+
+
+
+    tg = TelegramController(mgr)
+
+    tg.start()  # Non-blocking
+
+    
+
+    print("\n" + "="*50)
+
+    print("✅ Bot is running in background!")
+
+    print("="*50)
+
+    print("💡 You can now use other Jupyter cells freely")
+
+    print("⚠️ To stop bot: run `stop_bot()` in a new cell")
+
+    print("="*50 + "\n")
+
+    
+
+    return mgr, tg
+
+
+
+def stop_bot():
+
+    """봇 안전하게 종료"""
+
+    global mgr, tg
+
+    
+
+    print("🛑 Stopping bot...")
+
+    
+
+    if mgr:
+
+        try:
+
+            mgr.stop_loop()
+
+            mgr.save_state(force=True)
+
+            print("✅ Manager stopped")
+
+        except Exception as e:
+
+            print(f"⚠️ Manager stop error: {e}")
+
+    
+
+    if tg:
+
+        try:
+
+            tg.stop()
+
+            print("✅ Telegram stopped")
+
+        except Exception as e:
+
+            print(f"⚠️ Telegram stop error: {e}")
+
+    
+
+    print("✅ Bot stopped successfully!")
+
+
+
+if __name__ == "__main__":
+
+    # Script 실행 시
+
+    run_bot()
+
+    
+
+    # Keep alive (script mode only)
+
+    try:
+
+        import time
+
+        while True:
+
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+
+        stop_bot()
