@@ -371,14 +371,17 @@ class OpinionClient:
         except:
             return None, None
 
-    def get_my_positions(self, limit=100):
+    def get_my_positions(self, limit=100, silent=False):
         """Get positions via SDK (authenticated)"""
         try:
-            tg_log.log(f"📡 SDK: get_my_positions(limit={limit})")
+            if not silent:
+                tg_log.log(f"📡 SDK: get_my_positions(limit={limit})")
+
             resp = self.sdk.get_my_positions(limit=limit)
 
             if hasattr(resp, "errno") and resp.errno != 0:
-                tg_log.log(f"❌ SDK error: {resp.errmsg}")
+                if not silent:
+                    tg_log.log(f"❌ SDK error: {resp.errmsg}")
                 return []
 
             result = resp.result if hasattr(resp, "result") else resp
@@ -394,11 +397,13 @@ class OpinionClient:
                         positions = d[key]
                         break
 
-            tg_log.log(f"✅ Got {len(positions)} positions")
+            if not silent:
+                tg_log.log(f"✅ Got {len(positions)} positions")
             return [obj_to_dict(p) for p in positions]
 
         except Exception as e:
-            tg_log.log(f"❌ get_my_positions error: {e}")
+            if not silent:
+                tg_log.log(f"❌ get_my_positions error: {e}")
             return []
 
     def get_my_open_orders(self, mid):
@@ -539,17 +544,24 @@ class StrategyManager:
         threading.Thread(target=self._main_loop, daemon=True).start()
 
     def _main_loop(self):
-        """Background monitoring loop"""
+        """Background monitoring loop (silent)"""
         while self._running:
             try:
-                # Periodic position sync
-                all_positions = self.client.get_my_positions(limit=100)
+                # Only sync if we have active sessions
+                with self._lock:
+                    active_mids = [mid for mid, s in self.sessions.items() if s.is_running]
+
+                if not active_mids:
+                    # No active sessions, just sleep
+                    time.sleep(CONFIG["CHECK_INTERVAL"])
+                    continue
+
+                # Periodic position sync (silent - no telegram spam)
+                all_positions = self.client.get_my_positions(limit=100, silent=True)
 
                 with self._lock:
-                    for mid in list(self.sessions.keys()):
+                    for mid in active_mids:
                         s = self.sessions[mid]
-                        if not s.is_running:
-                            continue
 
                         # Update positions
                         for p in all_positions:
@@ -567,7 +579,8 @@ class StrategyManager:
                 time.sleep(CONFIG["CHECK_INTERVAL"])
 
             except Exception as e:
-                tg_log.log(f"❌ Loop error: {e}")
+                # Silent error logging (console only)
+                print(f"Background loop error: {e}")
                 time.sleep(10)
 
 
